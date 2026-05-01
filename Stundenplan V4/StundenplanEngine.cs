@@ -1,0 +1,1520 @@
+using Google.OrTools.Sat;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Stundenplan_V2
+{
+    public static class StundenplanEngine
+    {
+        // =====================================================
+        // DATENMODELL FÜR TAUSCHE
+        //
+        // TauschRolle: Ein Buchstabe innerhalb einer Gruppe,
+        //   z.B. "5a" → Lehrer Win, Blöcke [825, 1007]
+        //
+        // TauschGruppe: Alle Rollen mit gleicher Zahl,
+        //   z.B. Gruppe "5" → Rollen 5a, 5b, 5c, 5d, 5e
+        //
+        // TauschPaar: Ein konkreter Einzeltausch zweier Rollen
+        //   innerhalb einer Gruppe, z.B. 5a↔5b (Win↔VB)
+        //
+        // Eine Tausch-Kombination = Liste von TauschPaaren,
+        //   wobei jede Rolle höchstens einmal vorkommt.
+        //   Beispiel: [5a↔5b, 1a↔1b] = zwei gleichzeitige Tausche
+        // =====================================================
+
+        class TauschRolle
+        {
+            public string Zahl;
+            public string Buchstabe;
+            public string Lehrer;
+            public List<int> Blocks = new(); // Block-Indizes
+        }
+
+        class TauschGruppe
+        {
+            public string Zahl;
+            public List<TauschRolle> Rollen = new();
+        }
+
+        // Ein konkreter Tausch: RolleA↔RolleB innerhalb einer Gruppe
+        class TauschPaar
+        {
+            public TauschRolle RolleA;
+            public TauschRolle RolleB;
+            public string Label => $"{RolleA.Zahl}{RolleA.Buchstabe}↔{RolleB.Buchstabe}";
+        }
+
+        // =====================================================
+        // ÖFFENTLICHE EINSTIEGSMETHODE
+        // Gibt zurück: 2 beste ohne Tausch + 2 beste mit Tausch
+        // =====================================================
+        public static List<(int quality, int badUnits, int[,] belegung, string label, List<UnterrichtsBlock> blocks)> Planen(
+            string excelPfad,
+            List<UnterrichtsBlock> blocks,
+            List<ZeitSlot> slots,
+            Dictionary<string, int> fachraumLimit,
+            Dictionary<string, int> extraFreieTage,
+            int zeitlimitSekunden,
+            int anzahlLösungenOhne,
+            int anzahlLösungenMit,
+            HashSet<string> nichtFreieTage,
+            int gewichtFrüh,
+            int gewichtSpät,
+            int gewichtPäd,
+            int gewichtFrei,
+            int strafeHohl,
+            int strafeDoppelHohl,
+            int strafeDreifachHohl,
+            int strafeStdFolge,
+            int strafeEinzel,
+            int strafeSpäteLk,
+            Dictionary<string, LehrerStammdaten> lehrerStammdaten,
+            List<(int stundeVor, int stundeNach)> grossePausen,
+            bool verbotSpäteDoppel,
+            int hauptfachSpätAnteilProzent,
+            int strafeHauptfachSpät,
+            Action<string> log,
+            out string debug)
+        {
+            // --------------------------------------------------
+            // Tauschgruppen aufbauen
+            // --------------------------------------------------
+            var tauschGruppen = BaueTauschGruppen(blocks, log);
+
+            log($"Tauschgruppen gefunden: {tauschGruppen.Count}");
+            foreach (var g in tauschGruppen)
+                log($"  Gruppe {g.Zahl}: {string.Join(", ", g.Rollen.Select(r => $"{r.Buchstabe}={r.Lehrer}({r.Blocks.Count} Blöcke)"))}");
+
+            // Alle erlaubten Einzelpaare erzeugen (je 2 Rollen einer Gruppe)
+            var alleEinzelPaare = BaueAlleEinzelPaare(tauschGruppen);
+            log($"Erlaubte Einzeltausch-Paare: {alleEinzelPaare.Count}");
+
+            // --------------------------------------------------
+            // PHASE 1: Ohne Tausch – 2 beste Lösungen
+            // --------------------------------------------------
+            log("Phase 1: Ohne Tausch...");
+            var ohneBlöcke = blocks; // Original-Blöcke
+            var ohneLösungen = PlanenIntern(
+                excelPfad, blocks, slots, fachraumLimit, extraFreieTage,
+                log, maxLösungen: anzahlLösungenOhne, tauschKey: null,
+                zeitlimitSekunden: zeitlimitSekunden,
+                nichtFreieTage: nichtFreieTage,
+                gewichtFrüh: gewichtFrüh, gewichtSpät: gewichtSpät,
+                gewichtPäd: gewichtPäd, gewichtFrei: gewichtFrei,
+                strafeHohl: strafeHohl, strafeDoppelHohl: strafeDoppelHohl,
+                strafeDreifachHohl: strafeDreifachHohl, strafeStdFolge: strafeStdFolge,
+                strafeEinzel: strafeEinzel, strafeSpäteLk: strafeSpäteLk,
+                lehrerStammdaten: lehrerStammdaten,
+                grossePausen: grossePausen,
+                verbotSpäteDoppel: verbotSpäteDoppel,
+                hauptfachSpätAnteilProzent: hauptfachSpätAnteilProzent,
+                strafeHauptfachSpät: strafeHauptfachSpät);
+
+            log($"  Ohne Tausch: {ohneLösungen.Count} Lösungen" +
+                (ohneLösungen.Count > 0
+                    ? $", beste Qualität: {ohneLösungen[0].quality}"
+                    : " – KEINE LÖSUNG OHNE TAUSCH, starte trotzdem Phase 2..."));
+
+            // --------------------------------------------------
+            // PHASE 2: Die 5 aussichtsreichsten Tausch-Kombinationen
+            // --------------------------------------------------
+
+            // kombiKey → Paare dieser Kombination (für Export)
+            var tauschKeyZuPaaren = new Dictionary<string, List<TauschPaar>>();
+
+            var mitTauschLösungen = new List<(int quality, int badUnits, int[,] belegung, string tauschLabel, List<UnterrichtsBlock> blocks)>();
+            var mitTauschDiagnose = new List<string>(); // für Export
+
+            if (alleEinzelPaare.Count > 0 && anzahlLösungenMit > 0)
+            {
+                log("Bestimme aussichtsreichste Tausch-Kombinationen...");
+
+                var top5Kombinationen = BestimmeAussichtsreichsteTausche(
+                    alleEinzelPaare, blocks, slots, topN: 5, log);
+
+                // Alle Einzelpaare die noch nicht in Top-5 sind, hinten anhängen
+                // → so sieht man jeden möglichen Einzeltausch im Log
+                var bereitsGetestet = new HashSet<string>(top5Kombinationen.Select(KombiKey));
+                var zusätzlicheEinzelpaare = alleEinzelPaare
+                    .Select(p => new List<TauschPaar> { p })
+                    .Where(k => !bereitsGetestet.Contains(KombiKey(k)))
+                    .ToList();
+
+                log($"  Zusätzliche Einzelpaare (nicht in Top-5):");
+                foreach (var k in zusätzlicheEinzelpaare)
+                    log($"    [{KombiKey(k)}]");
+
+                var alleZuTesten = top5Kombinationen.Concat(zusätzlicheEinzelpaare).ToList();
+
+                log($"  Teste {top5Kombinationen.Count} Top-Kombinationen + {zusätzlicheEinzelpaare.Count} weitere Einzelpaare...");
+
+                for (int versuch = 0; versuch < alleZuTesten.Count; versuch++)
+                {
+                    var paare = alleZuTesten[versuch];
+                    string tauschKey = KombiKey(paare);
+
+                    tauschKeyZuPaaren[tauschKey] = paare;
+
+                    string art = versuch < top5Kombinationen.Count ? "Top-Kombination" : "Einzelpaar";
+                    log($"Phase 2 Versuch {versuch + 1}/{alleZuTesten.Count} ({art}): Tausche [{tauschKey}]...");
+
+                    var (getauschteBlöcke, getauschteSlots, getauschteFreieTage) = WendeTauschAn(blocks, slots, extraFreieTage, paare);
+
+                    // Versuche mit verschiedenen Seeds falls Infeasible
+                    var lösungen = new List<(int quality, int badUnits, int[,] belegung, string label)>();
+                    int[] seeds = { 1, 42, 123, 7, 999 };
+                    foreach (int seed in seeds)
+                    {
+                        lösungen = PlanenIntern(
+                            excelPfad, getauschteBlöcke, getauschteSlots, fachraumLimit, getauschteFreieTage,
+                            log, maxLösungen: anzahlLösungenMit, tauschKey: tauschKey,
+                            zeitlimitSekunden: zeitlimitSekunden,
+                            nichtFreieTage: nichtFreieTage,
+                            randomSeed: seed,
+                            gewichtFrüh: gewichtFrüh, gewichtSpät: gewichtSpät,
+                            gewichtPäd: gewichtPäd, gewichtFrei: gewichtFrei,
+                            strafeHohl: strafeHohl, strafeDoppelHohl: strafeDoppelHohl,
+                            strafeDreifachHohl: strafeDreifachHohl, strafeStdFolge: strafeStdFolge,
+                            strafeEinzel: strafeEinzel, strafeSpäteLk: strafeSpäteLk,
+                            lehrerStammdaten: lehrerStammdaten,
+                            grossePausen: grossePausen,
+                            verbotSpäteDoppel: verbotSpäteDoppel,
+                            hauptfachSpätAnteilProzent: hauptfachSpätAnteilProzent,
+                            strafeHauptfachSpät: strafeHauptfachSpät);
+                        if (lösungen.Count > 0)
+                        {
+                            log($"  Lösung gefunden mit Seed {seed}.");
+                            break;
+                        }
+                        log($"  Seed {seed}: keine Lösung, versuche nächsten...");
+                    }
+
+                    if (lösungen.Count == 0)
+                    {
+                        string msg = $"Versuch {versuch + 1} [{tauschKey}]: KEINE LÖSUNG (Infeasible)";
+                        log($"  {msg}");
+                        mitTauschDiagnose.Add(msg);
+                    }
+                    else
+                    {
+                        string msg = $"Versuch {versuch + 1} [{tauschKey}]: {lösungen.Count} Lösungen, Qualitäten: {string.Join(", ", lösungen.Select(l => l.quality))}";
+                        log($"  {msg}");
+                        mitTauschDiagnose.Add(msg);
+                    }
+
+                    foreach (var l in lösungen)
+                        mitTauschLösungen.Add((l.quality, l.badUnits, l.belegung, l.label, getauschteBlöcke));
+                }
+            }
+            else
+            {
+                log("Keine Tauschpaare vorhanden – überspringe Phase 2.");
+                mitTauschDiagnose.Add("Keine Tauschpaare vorhanden.");
+            }
+
+            // --------------------------------------------------
+            // Ergebnisse zusammenstellen
+            // --------------------------------------------------
+            var ergebnis = new List<(int quality, int badUnits, int[,] belegung, string label, List<UnterrichtsBlock> blocks)>();
+
+            // beste OhneTausch-Lösungen → nach Qualität sortieren und Labels neu vergeben
+            var ohneSortiert = ohneLösungen
+                .OrderByDescending(l => l.quality)
+                .Take(anzahlLösungenOhne)
+                .ToList();
+
+            for (int i = 0; i < ohneSortiert.Count; i++)
+            {
+                var l = ohneSortiert[i];
+                string neuesLabel = $"OhneTausch_{i + 1}";
+                ergebnis.Add((l.quality, l.badUnits, l.belegung, neuesLabel, blocks));
+            }
+
+            var topNMitTausch = mitTauschLösungen
+                .OrderByDescending(l => l.quality)
+                .Take(anzahlLösungenMit)
+                .ToList();
+
+            // Labels neu vergeben: Tausch-Key behalten, Nummer nach Qualitätsrang
+            var tauschNummern = new Dictionary<string, int>(); // tauschKey → nächste Nummer
+            foreach (var l in topNMitTausch)
+            {
+                string key = ExtrahiereTauschKey(l.tauschLabel);
+                if (!tauschNummern.ContainsKey(key)) tauschNummern[key] = 1;
+                string neuesLabel = $"Tausch_{key}_{tauschNummern[key]++}";
+                ergebnis.Add((l.quality, l.badUnits, l.belegung, neuesLabel, l.blocks));
+            }
+
+            // --------------------------------------------------
+            // Tauschliste exportieren
+            // --------------------------------------------------
+            {
+                // Für jede Top-Lösung die getauschten Paare nachschlagen
+                var topFürExport = new List<(string label, List<TauschPaar> paare)>();
+
+                foreach (var l in topNMitTausch)
+                {
+                    string key = ExtrahiereTauschKey(l.tauschLabel);
+                    var paare = tauschKeyZuPaaren.TryGetValue(key, out var p) ? p : new List<TauschPaar>();
+                    topFürExport.Add((l.tauschLabel, paare));
+                }
+
+                ExportiereTauschListe(
+                    excelPfad,
+                    blocks,
+                    tauschGruppen,
+                    topFürExport,
+                    mitTauschDiagnose);
+            }
+
+            debug = $"{ohneLösungen.Count} Lösungen ohne Tausch, {topNMitTausch.Count} beste mit Tausch.";
+            return ergebnis;
+        }
+
+        // =====================================================
+        // INTERNER SOLVER
+        // tauschKey = null → kein Tausch; sonst: Key der getauschten Kombination
+        // =====================================================
+        private static List<(int quality, int badUnits, int[,] belegung, string label)> PlanenIntern(
+            string excelPfad,
+            List<UnterrichtsBlock> blocks,
+            List<ZeitSlot> slots,
+            Dictionary<string, int> fachraumLimit,
+            Dictionary<string, int> extraFreieTage,
+            Action<string> log,
+            int maxLösungen,
+            string tauschKey,
+            int zeitlimitSekunden = 10,
+            HashSet<string> nichtFreieTage = null,
+            int randomSeed = 1,
+            int gewichtFrüh = 1,
+            int gewichtSpät = 5,
+            int gewichtPäd = 5,
+            int gewichtFrei = 2,
+            int strafeHohl = 1,
+            int strafeDoppelHohl = 5,
+            int strafeDreifachHohl = 5,
+            int strafeStdFolge = 5,
+            int strafeEinzel = 0,
+            int strafeSpäteLk = 0,
+            Dictionary<string, LehrerStammdaten> lehrerStammdaten = null,
+            List<(int stundeVor, int stundeNach)> grossePausen = null,
+            bool verbotSpäteDoppel = false,
+            int hauptfachSpätAnteilProzent = 50,
+            int strafeHauptfachSpät = 0)
+        {
+            var model = new CpModel();
+            int B = blocks.Count;
+            int S = slots.Count;
+
+            // =====================================================
+            // FREIE TAGE
+            // =====================================================
+            var lehrerListe = blocks
+                .SelectMany(b => b.Teile)
+                .Select(t => t.Lehrer)
+                .Distinct()
+                .ToList();
+
+            var tageListe = slots
+                .Select(s => s.WTag)
+                .Distinct()
+                .ToList();
+
+            BoolVar[,] free = new BoolVar[lehrerListe.Count, tageListe.Count];
+
+            for (int l = 0; l < lehrerListe.Count; l++)
+                for (int day = 0; day < tageListe.Count; day++)
+                    free[l, day] = model.NewBoolVar($"free_{l}_{day}");
+
+            for (int l = 0; l < lehrerListe.Count; l++)
+            {
+                string name = lehrerListe[l];
+                if (!extraFreieTage.ContainsKey(name)) continue;
+
+                model.Add(LinearExpr.Sum(
+                    Enumerable.Range(0, tageListe.Count).Select(day => free[l, day])
+                ) == extraFreieTage[name]);
+            }
+
+            for (int l = 0; l < lehrerListe.Count; l++)
+            {
+                string lehrer = lehrerListe[l];
+                for (int day = 0; day < tageListe.Count; day++)
+                {
+                    string tag = tageListe[day];
+                    bool istFixFrei = slots
+                        .Where(s => s.WTag == tag)
+                        .All(s => s.LehrerWunsch.TryGetValue(lehrer, out int lw) && lw == -3);
+
+                    if (istFixFrei)
+                        model.Add(free[l, day] == 0);
+                }
+            }
+
+            // =====================================================
+            // ENTSCHEIDUNGSVARIABLEN
+            // =====================================================
+            BoolVar[,] x = new BoolVar[B, S];
+            for (int b = 0; b < B; b++)
+                for (int s = 0; s < S; s++)
+                    x[b, s] = model.NewBoolVar($"x_b{b}_s{s}");
+
+            // =====================================================
+            // WOCHENSTUNDEN
+            // =====================================================
+            for (int b = 0; b < B; b++)
+                model.Add(LinearExpr.Sum(Enumerable.Range(0, S).Select(s => x[b, s])) == blocks[b].Wst);
+
+            // =====================================================
+            // FIX-UNR
+            // =====================================================
+            for (int s = 0; s < S; s++)
+                foreach (var unr in slots[s].FixUNrn)
+                    for (int b = 0; b < B; b++)
+                        if (blocks[b].UNr == unr)
+                            model.Add(x[b, s] == 1);
+
+            // =====================================================
+            // LEHRERREGEL
+            // =====================================================
+            for (int s = 0; s < S; s++)
+            {
+                var map = new Dictionary<string, List<int>>();
+                for (int b = 0; b < B; b++)
+                    foreach (var l in blocks[b].Teile.Select(t => t.Lehrer).Distinct())
+                    {
+                        if (!map.ContainsKey(l)) map[l] = new List<int>();
+                        map[l].Add(b);
+                    }
+
+                foreach (var kv in map)
+                    model.Add(LinearExpr.Sum(kv.Value.Select(b => x[b, s])) <= 1);
+            }
+
+            // =====================================================
+            // KLASSENREGEL
+            // =====================================================
+            ClassConstraint.Add(model, x, blocks, S);
+
+            // =====================================================
+            // FACHRAUMLIMIT
+            // =====================================================
+            RoomConstraint.Add(model, x, blocks, fachraumLimit, S);
+
+            // =====================================================
+            // SPERRSLOTS (-3)
+            // =====================================================
+            TimeConstraint.AddBlockedSlots(model, x, blocks, slots, B, S);
+
+            // =====================================================
+            // FREIE TAGE CONSTRAINT
+            // =====================================================
+            FreeDayConstraint.Add(model, x, free, blocks, slots, lehrerListe, tageListe, B);
+
+            // =====================================================
+            // DOPPELSTUNDENVARIABLEN
+            // =====================================================
+            BoolVar[,] d = new BoolVar[B, S];
+
+            for (int b = 0; b < B; b++)
+            {
+                for (int s = 0; s < S - 1; s++)
+                {
+                    if (slots[s].WTag == slots[s + 1].WTag &&
+                        slots[s].Stunde + 1 == slots[s + 1].Stunde)
+                    {
+                        d[b, s] = model.NewBoolVar($"d_b{b}_s{s}");
+                        model.Add(x[b, s] == 1).OnlyEnforceIf(d[b, s]);
+                        model.Add(x[b, s + 1] == 1).OnlyEnforceIf(d[b, s]);
+                        model.Add(x[b, s] + x[b, s + 1] - d[b, s] <= 1);
+                    }
+                }
+            }
+
+            // =====================================================
+            // GROSSE PAUSEN: Doppelstunden nicht über Pause
+            // Für Blöcke ohne (E): d[b,s] = 0 wenn s→s+1 eine große Pause überschreitet
+            // =====================================================
+            if (grossePausen != null && grossePausen.Count > 0)
+            {
+                for (int b = 0; b < B; b++)
+                {
+                    if (blocks[b].DoppelÜberPauseErlaubt) continue;
+
+                    for (int s = 0; s < S - 1; s++)
+                    {
+                        if (d[b, s] == null) continue;
+
+                        int stundeVon = slots[s].Stunde;
+                        int stundeNach = slots[s + 1].Stunde;
+
+                        // Prüfe ob dieser Übergang eine große Pause überschreitet
+                        bool istPause = grossePausen.Any(p =>
+                            p.stundeVor == stundeVon && p.stundeNach == stundeNach);
+
+                        if (istPause)
+                            model.Add(d[b, s] == 0);
+                    }
+                }
+            }
+            for (int b = 0; b < B; b++)
+            {
+                int minD = blocks[b].Teile.Max(t => t.MinDoppel);
+                int maxD = blocks[b].Teile.Max(t => t.MaxDoppel);
+
+                var dVars = new List<BoolVar>();
+                for (int s = 0; s < S - 1; s++)
+                    if (d[b, s] != null) dVars.Add(d[b, s]);
+
+                if (dVars.Count > 0)
+                {
+                    model.Add(LinearExpr.Sum(dVars) >= minD);
+                    model.Add(LinearExpr.Sum(dVars) <= maxD);
+                }
+            }
+
+            // =====================================================
+            // VERBOT SPÄTE DOPPELSTUNDEN
+            // Falls aktiviert: keine Doppelstunden ab Stunde 6/7
+            // Stunde 5/6 bleibt weiterhin erlaubt
+            // =====================================================
+            if (verbotSpäteDoppel)
+            {
+                for (int b = 0; b < B; b++)
+                {
+                    for (int s = 0; s < S - 1; s++)
+                    {
+                        if (d[b, s] == null) continue;
+                        if (slots[s].Stunde >= 6)
+                            model.Add(d[b, s] == 0);
+                    }
+                }
+            }
+
+            // =====================================================
+            // KEINE 3 STUNDEN HINTEREINANDER
+            // =====================================================
+            for (int b = 0; b < B; b++)
+                for (int s = 0; s < S - 2; s++)
+                    if (slots[s].WTag == slots[s + 1].WTag &&
+                        slots[s].WTag == slots[s + 2].WTag &&
+                        slots[s].Stunde + 1 == slots[s + 1].Stunde &&
+                        slots[s].Stunde + 2 == slots[s + 2].Stunde)
+                        model.Add(x[b, s] + x[b, s + 1] + x[b, s + 2] <= 2);
+
+            // =====================================================
+            // SPÄTE PÄDAGOGISCHE EINHEITEN
+            // =====================================================
+            var badEinheiten = PlanBewertung.SolverSpaetePaedEinheiten(model, x, blocks, slots);
+
+            // =====================================================
+            // TAGESREGEL (max 2 Stunden pro Block pro Tag)
+            // =====================================================
+            // TAGESREGEL
+            // - maxD=0 und Wst>=2: max 1 Stunde pro Tag (Einzelstunden an verschiedenen Tagen)
+            // - sonst: max 2 Stunden pro Tag
+            // =====================================================
+            var tage = slots.Select(z => z.WTag).Distinct();
+
+            foreach (var tag in tage)
+            {
+                var daySlots = slots
+                    .Select((z, i) => new { z, i })
+                    .Where(z => z.z.WTag == tag)
+                    .OrderBy(z => z.z.Stunde)
+                    .ToList();
+
+                for (int b = 0; b < B; b++)
+                {
+                    int maxD = blocks[b].Teile.Max(t => t.MaxDoppel);
+                    int limit = (maxD == 0 && blocks[b].Wst >= 2) ? 1 : 2;
+                    model.Add(LinearExpr.Sum(daySlots.Select(z => x[b, z.i])) <= limit);
+                }
+            }
+
+            // =====================================================
+            // FACH PRO KLASSE PRO TAG MAX 2
+            // =====================================================
+            var fachKlasseMap = new Dictionary<(string klasse, string fach), HashSet<int>>();
+
+            for (int b = 0; b < B; b++)
+                foreach (var t in blocks[b].Teile)
+                    foreach (var k in t.Klassen)
+                    {
+                        var key = (k, t.Fach);
+                        if (!fachKlasseMap.ContainsKey(key)) fachKlasseMap[key] = new HashSet<int>();
+                        fachKlasseMap[key].Add(b); // HashSet verhindert Duplikate
+                    }
+
+            foreach (var tag in tage)
+            {
+                var daySlots = slots
+                    .Select((z, i) => new { z, i })
+                    .Where(z => z.z.WTag == tag)
+                    .Select(z => z.i)
+                    .ToList();
+
+                foreach (var kv in fachKlasseMap)
+                {
+                    var vars = new List<IntVar>();
+                    foreach (var b in kv.Value)
+                        foreach (var s in daySlots)
+                            vars.Add(x[b, s]);
+
+                    model.Add(LinearExpr.Sum(vars) <= 2);
+                }
+            }
+
+            // =====================================================
+            // ZIELFUNKTION
+            // =====================================================
+            var earlyVars = new List<BoolVar>();
+            var lateVars = new List<BoolVar>();
+
+            for (int b = 0; b < B; b++)
+                for (int s = 0; s < S - 1; s++)
+                {
+                    if (d[b, s] == null) continue;
+                    if (slots[s].Stunde <= 5) earlyVars.Add(d[b, s]);
+                    else lateVars.Add(d[b, s]);
+                }
+
+            var freeRewardVars = new List<BoolVar>();
+            var ausgeschlossen = nichtFreieTage ?? new HashSet<string>();
+            for (int l = 0; l < lehrerListe.Count; l++)
+                for (int day = 0; day < tageListe.Count; day++)
+                    if (!ausgeschlossen.Contains(tageListe[day]))
+                        freeRewardVars.Add(free[l, day]);
+
+            // =====================================================
+            // HOHLSTUNDEN-VARIABLEN
+            // Für jeden Lehrer, jeden Tag: Hohlstunden = Slots ohne Unterricht
+            // zwischen erstem und letztem Unterrichtsslot des Tages
+            // =====================================================
+            var hohlVars = new List<BoolVar>();
+            var doppelHohlVars = new List<BoolVar>();
+            var dreifachHohlVars = new List<BoolVar>();
+            var stdFolgeVars = new List<BoolVar>();
+            var einzelVars = new List<BoolVar>();
+
+            // Nur berechnen wenn mindestens ein Strafwert != 0
+            bool hohlstundenAktiv = strafeHohl != 0 || strafeDoppelHohl != 0 ||
+                                    strafeDreifachHohl != 0 || strafeStdFolge != 0 ||
+                                    strafeEinzel != 0;
+
+            if (hohlstundenAktiv)
+            {
+                lehrerStammdaten = lehrerStammdaten ?? new Dictionary<string, LehrerStammdaten>();
+
+                for (int l = 0; l < lehrerListe.Count; l++)
+                {
+                    string lName = lehrerListe[l];
+                    lehrerStammdaten.TryGetValue(lName, out var sd);
+                    int? maxFolge = sd?.StdFolge;
+
+                    // Blöcke dieses Lehrers
+                    var lehrerBlöcke = Enumerable.Range(0, B)
+                        .Where(b => blocks[b].Teile.Any(t => t.Lehrer == lName))
+                        .ToList();
+                    if (lehrerBlöcke.Count == 0) continue;
+
+                    for (int dayIdx = 0; dayIdx < tageListe.Count; dayIdx++)
+                    {
+                        string tag = tageListe[dayIdx];
+
+                        var tagesSlots = Enumerable.Range(0, S)
+                            .Where(s => slots[s].WTag == tag)
+                            .OrderBy(s => slots[s].Stunde)
+                            .ToList();
+
+                        if (tagesSlots.Count < 2) continue;
+
+                        // Für jeden Slot: hat Lehrer Unterricht?
+                        // u[si] = 1 gdw. mindestens ein Block des Lehrers in diesem Slot
+                        // Lineare Formulierung ohne AddMaxEquality:
+                        // u[si] >= x[b,sIdx] für jeden Block b  (u=1 wenn irgendein Block belegt)
+                        // u[si] <= Sum(x[b,sIdx])                (u=0 wenn kein Block belegt)
+                        var u = new BoolVar[tagesSlots.Count];
+                        for (int si = 0; si < tagesSlots.Count; si++)
+                        {
+                            int sIdx = tagesSlots[si];
+                            u[si] = model.NewBoolVar($"u_{l}_{dayIdx}_{si}");
+
+                            var blöckeInSlot = lehrerBlöcke.Select(b => x[b, sIdx]).ToList();
+                            if (blöckeInSlot.Count == 0)
+                            {
+                                model.Add(u[si] == 0);
+                                continue;
+                            }
+                            // u >= jeder einzelne Block
+                            foreach (var bv in blöckeInSlot)
+                                model.Add(u[si] >= bv);
+                            // u <= Summe aller Blöcke
+                            model.Add(LinearExpr.Sum(blöckeInSlot) >= u[si]);
+                        }
+
+                        int n = tagesSlots.Count;
+
+                        // Hohlstunden: si ist Hohlstunde wenn u[si-1]=1, u[si]=0, u[si+1]=1
+                        // Bidirektionale Modellierung:
+                        // hohlVar=1 gdw. u[si-1]+u[si+1]-u[si] >= 2
+                        for (int si = 1; si < n - 1; si++)
+                        {
+                            if (strafeHohl != 0)
+                            {
+                                var hohlVar = model.NewBoolVar($"hohl_{l}_{dayIdx}_{si}");
+                                // hohlVar=1 → u[si-1]=1 AND u[si]=0 AND u[si+1]=1
+                                // Äquivalent: hohlVar=1 gdw. u[si-1]+u[si+1]+(1-u[si]) >= 3
+                                // → u[si-1] + u[si+1] - u[si] >= 2*hohlVar
+                                // → u[si-1] + u[si+1] - u[si] <= 2 - (1 - hohlVar)*0 (immer <=2)
+                                // Korrekte lineare Formulierung:
+                                // hohlVar >= u[si-1] + u[si+1] - u[si] - 1
+                                // hohlVar <= (1-u[si])
+                                // hohlVar <= u[si-1]
+                                // hohlVar <= u[si+1]
+                                model.Add(hohlVar >= u[si - 1] + u[si + 1] - u[si] - 1);
+                                model.Add(hohlVar <= 1 - u[si]);
+                                model.Add(hohlVar <= u[si - 1]);
+                                model.Add(hohlVar <= u[si + 1]);
+                                hohlVars.Add(hohlVar);
+                            }
+
+                            // Doppelhohlstunde: si-1 und si beide leer, si-2 und si+1 belegt
+                            if (strafeDoppelHohl != 0 && si >= 2)
+                            {
+                                var doppelVar = model.NewBoolVar($"doppelhohl_{l}_{dayIdx}_{si}");
+                                model.Add(doppelVar >= u[si - 2] + u[si + 1] - u[si - 1] - u[si] - 1);
+                                model.Add(doppelVar <= 1 - u[si - 1]);
+                                model.Add(doppelVar <= 1 - u[si]);
+                                model.Add(doppelVar <= u[si - 2]);
+                                model.Add(doppelVar <= u[si + 1]);
+                                doppelHohlVars.Add(doppelVar);
+                            }
+
+                            // Dreifachhohlstunde: si-2, si-1, si leer; si-3 und si+1 belegt
+                            if (strafeDreifachHohl != 0 && si >= 3)
+                            {
+                                var dreiVar = model.NewBoolVar($"dreihohl_{l}_{dayIdx}_{si}");
+                                model.Add(dreiVar >= u[si - 3] + u[si + 1] - u[si - 2] - u[si - 1] - u[si] - 1);
+                                model.Add(dreiVar <= 1 - u[si - 2]);
+                                model.Add(dreiVar <= 1 - u[si - 1]);
+                                model.Add(dreiVar <= 1 - u[si]);
+                                model.Add(dreiVar <= u[si - 3]);
+                                model.Add(dreiVar <= u[si + 1]);
+                                dreifachHohlVars.Add(dreiVar);
+                            }
+                        }
+
+                        // Einzelstunden: genau 1 Unterrichtsstunde am Tag
+                        if (strafeEinzel != 0)
+                        {
+                            // Summe der u-Werte = 1 → Einzelstunde
+                            var einzelVar = model.NewBoolVar($"einzel_{l}_{dayIdx}");
+                            var sumVar = model.NewIntVar(0, n, $"sum_{l}_{dayIdx}");
+                            model.Add(sumVar == LinearExpr.Sum(u));
+                            model.Add(sumVar == 1).OnlyEnforceIf(einzelVar);
+                            model.Add(sumVar != 1).OnlyEnforceIf(einzelVar.Not());
+                            einzelVars.Add(einzelVar);
+                        }
+
+                        // Stundenfolge: längste aufeinanderfolgende Unterrichtssequenz
+                        // überschreitet maxFolge → Strafe
+                        if (strafeStdFolge != 0 && maxFolge.HasValue)
+                        {
+                            int limit = maxFolge.Value;
+
+                            // Für jedes Fenster der Länge (limit+1):
+                            // wenn alle u[si..si+limit] = 1 → Überschreitung
+                            for (int si = 0; si <= n - (limit + 1); si++)
+                            {
+                                var folgeVar = model.NewBoolVar(
+                                    $"folge_{l}_{dayIdx}_{si}");
+
+                                var fensterVars = Enumerable.Range(si, limit + 1)
+                                    .Select(idx => u[idx])
+                                    .ToList();
+
+                                // folgeVar <= u[si+k] für alle k im Fenster
+                                foreach (var uv in fensterVars)
+                                    model.Add(folgeVar <= uv);
+
+                                // folgeVar >= Sum(u im Fenster) - limit
+                                model.Add(folgeVar >=
+                                    LinearExpr.Sum(fensterVars) - limit);
+
+                                stdFolgeVars.Add(folgeVar);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // =====================================================
+            // SPÄTE LK-STUNDEN
+            // LK-Blöcke (ZeilenText enthält "LK") dürfen max 2 Stunden
+            // nach Stunde 5 haben. Jede weitere wird bestraft.
+            // =====================================================
+            var späteLkVars = new List<BoolVar>();
+            if (strafeSpäteLk != 0)
+            {
+                for (int b = 0; b < B; b++)
+                {
+                    // LK-Block erkennen: Zeilentext enthält "LK"
+                    if (!blocks[b].Zeilentext.Contains("LK",
+                        StringComparison.OrdinalIgnoreCase)) continue;
+
+                    // Slots nach Stunde 5 für diesen Block
+                    var spätSlots = Enumerable.Range(0, S)
+                        .Where(s => slots[s].Stunde > 5)
+                        .ToList();
+
+                    if (spätSlots.Count == 0) continue;
+
+                    // Summe der späten Stunden für diesen Block
+                    var spätSum = model.NewIntVar(0, spätSlots.Count,
+                        $"lkspät_b{b}");
+                    model.Add(spätSum == LinearExpr.Sum(
+                        spätSlots.Select(s => x[b, s])));
+
+                    // Für jede Stunde über 2 → eine Strafe-Variable
+                    for (int k = 3; k <= blocks[b].Wst; k++)
+                    {
+                        var strafVar = model.NewBoolVar($"lkstraf_b{b}_k{k}");
+                        model.Add(spätSum >= k).OnlyEnforceIf(strafVar);
+                        model.Add(spätSum < k).OnlyEnforceIf(strafVar.Not());
+                        späteLkVars.Add(strafVar);
+                    }
+                }
+            }
+
+            // =====================================================
+            // HAUPTFACH-STRAFE (D,E,M,F nicht zu oft nach Stunde 4)
+            // Päd. Einheit Typ 2: gleiche Klasse + gleiches Fach
+            // =====================================================
+            var hauptfachSpätVars = new List<BoolVar>();
+            var hauptfächer = new HashSet<string> { "D", "E", "M", "F" };
+
+            if (strafeHauptfachSpät != 0)
+            {
+                var einheiten = new Dictionary<(string klasse, string fach), List<int>>();
+
+                for (int b = 0; b < B; b++)
+                {
+                    foreach (var t in blocks[b].Teile)
+                    {
+                        string fachTrim = t.Fach.Trim();
+                        if (!hauptfächer.Contains(fachTrim)) continue;
+
+                        foreach (var klasse in t.Klassen)
+                        {
+                            var key = (klasse, fachTrim);
+                            if (!einheiten.ContainsKey(key))
+                                einheiten[key] = new List<int>();
+                            if (!einheiten[key].Contains(b))
+                                einheiten[key].Add(b);
+                        }
+                    }
+                }
+
+                foreach (var kv in einheiten)
+                {
+                    var blockIds = kv.Value;
+                    string keyStr = $"{kv.Key.klasse}_{kv.Key.fach}";
+
+                    int gesamtWst = blockIds.Sum(b => blocks[b].Wst);
+                    if (gesamtWst == 0) continue;
+
+                    int erlaubtSpät = (int)Math.Floor(
+                        gesamtWst * hauptfachSpätAnteilProzent / 100.0);
+
+                    var spätSlots = Enumerable.Range(0, S)
+                        .Where(s => slots[s].Stunde >= 5)
+                        .ToList();
+
+                    if (spätSlots.Count == 0) continue;
+
+                    var spätSumVars = blockIds
+                        .SelectMany(b => spätSlots.Select(s => (IntVar)x[b, s]))
+                        .ToList();
+
+                    var spätSum = model.NewIntVar(0, gesamtWst, $"hfspät_{keyStr}");
+                    model.Add(spätSum == LinearExpr.Sum(spätSumVars));
+
+                    int maxMöglich = Math.Min(gesamtWst, spätSlots.Count);
+                    for (int k = erlaubtSpät + 1; k <= maxMöglich; k++)
+                    {
+                        var strafVar = model.NewBoolVar($"hfstraf_{keyStr}_k{k}");
+                        model.Add(spätSum >= k).OnlyEnforceIf(strafVar);
+                        model.Add(spätSum < k).OnlyEnforceIf(strafVar.Not());
+                        hauptfachSpätVars.Add(strafVar);
+                    }
+                }
+            }
+
+            var qualityExpr = ObjectiveBuilder.Build(
+                model, earlyVars, lateVars, badEinheiten, freeRewardVars,
+                hohlVars, doppelHohlVars, dreifachHohlVars, einzelVars, stdFolgeVars,
+                späteLkVars, hauptfachSpätVars,
+                gewichtFrüh, gewichtSpät, gewichtPäd, gewichtFrei,
+                strafeHohl, strafeDoppelHohl, strafeDreifachHohl, strafeEinzel,
+                strafeStdFolge, strafeSpäteLk, strafeHauptfachSpät);
+            model.Maximize(qualityExpr);
+
+            // =====================================================
+            // SOLVER
+            // =====================================================
+            var solver = new CpSolver();
+            solver.StringParameters =
+                $"max_time_in_seconds:{zeitlimitSekunden} num_search_workers:8 random_seed:{randomSeed} log_search_progress:true";
+
+            var lösungen = new List<(int quality, int badUnits, int[,] belegung, string label)>();
+
+            string labelPrefix = tauschKey == null
+                ? "OhneTausch"
+                : "Tausch_" + tauschKey;
+
+            // Phase 1: Beste Lösung
+            var status = solver.Solve(model);
+
+            if (status != CpSolverStatus.Optimal && status != CpSolverStatus.Feasible)
+            {
+                log($"  [Diagnose] Infeasible ({(tauschKey == null ? "OhneTausch" : $"Tausch [{tauschKey}]")})");
+                log($"  [Diagnose] Status: {status}");
+                log($"  [Diagnose] Blöcke: {B}, Slots: {S}");
+                log($"  [Diagnose] Lehrer: {lehrerListe.Count}, Gesamt-Wst: {blocks.Sum(b => b.Wst)}");
+
+                // Fix-Slot-Konflikte prüfen
+                var fixKonflikte = new List<string>();
+                foreach (var slot in slots.Where(s => s.FixUNrn.Count > 1))
+                {
+                    var lehrerImSlot = new HashSet<string>();
+                    foreach (var unr in slot.FixUNrn)
+                    {
+                        var block = blocks.FirstOrDefault(b => b.UNr == unr);
+                        if (block == null) continue;
+                        foreach (var t in block.Teile)
+                            if (!lehrerImSlot.Add(t.Lehrer))
+                                fixKonflikte.Add($"{slot.WTag} Std.{slot.Stunde}: {t.Lehrer} doppelt");
+                    }
+                }
+                if (fixKonflikte.Count > 0)
+                    foreach (var k in fixKonflikte)
+                        log($"  [Diagnose] Fix-Konflikt: {k}");
+
+                // Klassen mit zu vielen Wochenstunden
+                var klassenWst = new Dictionary<string, int>();
+                foreach (var bl in blocks)
+                    foreach (var t in bl.Teile)
+                        foreach (var k in t.Klassen)
+                        {
+                            if (!klassenWst.ContainsKey(k)) klassenWst[k] = 0;
+                            klassenWst[k] += bl.Wst;
+                        }
+                foreach (var kv in klassenWst.Where(x => x.Value > S)
+                                              .OrderByDescending(x => x.Value))
+                    log($"  [Diagnose] ⚠️ Klasse {kv.Key}: {kv.Value} Wst > {S} Slots!");
+
+                // Lehrer mit zu wenig verfügbaren Slots
+                var lehrerWst = blocks
+                    .SelectMany(b => b.Teile.Select(t => (t.Lehrer, b.Wst)))
+                    .GroupBy(x => x.Lehrer)
+                    .Select(g => (lehrer: g.Key, wst: g.Sum(x => x.Wst)))
+                    .OrderByDescending(x => x.wst)
+                    .Take(10);
+
+                foreach (var (lehrer, wst) in lehrerWst)
+                {
+                    int sperren = slots.Count(s => s.LehrerWunsch.TryGetValue(lehrer, out int w) && w == -3);
+                    int verfügbar = S - sperren;
+                    string warnung = wst > verfügbar ? " ⚠️ ZU WENIG SLOTS!" : "";
+                    log($"  [Diagnose]   {lehrer}: {wst} Wst, {sperren} Sperren, {verfügbar} verfügbar{warnung}");
+                }
+
+                // Blöcke mit unmöglichen Doppelstunden
+                for (int b = 0; b < B; b++)
+                {
+                    int minD = blocks[b].Teile.Max(t => t.MinDoppel);
+                    if (minD == 0) continue;
+                    var dVarsB = new List<BoolVar>();
+                    for (int s = 0; s < S - 1; s++)
+                        if (d[b, s] != null) dVarsB.Add(d[b, s]);
+                    if (dVarsB.Count < minD)
+                        log($"  [Diagnose] UNr {blocks[b].UNr}: minD={minD} aber nur {dVarsB.Count} mögliche Doppelslots");
+                }
+
+                return lösungen;
+            }
+
+            int bestQuality = (int)solver.Value(qualityExpr);
+            var bestBelegung = ExtrahiereBelegung(solver, x, B, S);
+            int bestBad = badEinheiten.Count(v => solver.Value(v) == 1);
+
+            lösungen.Add((bestQuality, bestBad, bestBelegung, labelPrefix + "_1"));
+
+            // Phase 2: Weitere diverse Lösungen
+            for (int k = 1; k < maxLösungen; k++)
+            {
+                model.Add(qualityExpr <= bestQuality);
+
+                var forbid = new List<ILiteral>();
+                for (int b = 0; b < B; b++)
+                    for (int s = 0; s < S; s++)
+                    {
+                        if (bestBelegung[b, s] == 1) forbid.Add(x[b, s].Not());
+                        else forbid.Add(x[b, s]);
+                    }
+
+                model.AddBoolOr(forbid);
+
+                status = solver.Solve(model);
+
+                if (status != CpSolverStatus.Optimal && status != CpSolverStatus.Feasible)
+                    break;
+
+                int quality = (int)solver.Value(qualityExpr);
+                var belegung = ExtrahiereBelegung(solver, x, B, S);
+                int badCount = badEinheiten.Count(v => solver.Value(v) == 1);
+
+                lösungen.Add((quality, badCount, belegung, labelPrefix + "_" + (k + 1)));
+                bestBelegung = belegung;
+            }
+
+            return lösungen;
+        }
+
+        // =====================================================
+        // =====================================================
+        // HILFSMETHODE: Kombinations-Key aus Paarliste
+        // =====================================================
+        private static string KombiKey(List<TauschPaar> paare)
+            => string.Join("+", paare.Select(p => p.Label).OrderBy(l => l));
+
+        // =====================================================
+        // TAUSCHGRUPPEN AUFBAUEN
+        // Liest alle LTKZ, gruppiert nach Zahl.
+        // Pro Gruppe können beliebig viele Buchstaben existieren.
+        // =====================================================
+        private static List<TauschGruppe> BaueTauschGruppen(
+            List<UnterrichtsBlock> blocks,
+            Action<string> log = null)
+        {
+            // (Zahl, Buchstabe) → (Lehrer, BlockIndex-Set)
+            var dict = new Dictionary<(string zahl, string buch), (string lehrer, HashSet<int> blockIds)>();
+
+            for (int b = 0; b < blocks.Count; b++)
+            {
+                foreach (var t in blocks[b].Teile)
+                {
+                    if (string.IsNullOrWhiteSpace(t.Ltkz)) continue;
+
+                    string ltkz = t.Ltkz.Trim();
+                    string zahl = new string(ltkz.TakeWhile(char.IsDigit).ToArray());
+                    string buch = ltkz.Substring(zahl.Length).Trim().ToLower();
+
+                    if (string.IsNullOrEmpty(zahl) || string.IsNullOrEmpty(buch)) continue;
+
+                    var key = (zahl, buch);
+                    if (!dict.ContainsKey(key))
+                        dict[key] = (t.Lehrer, new HashSet<int>());
+
+                    var entry = dict[key];
+                    entry.blockIds.Add(b);
+                    dict[key] = (t.Lehrer, entry.blockIds); // Lehrer aktualisieren
+                }
+            }
+
+            log?.Invoke($"  LTKZ-Einträge: {dict.Count}");
+            foreach (var kv in dict.OrderBy(x => x.Key.zahl).ThenBy(x => x.Key.buch))
+                log?.Invoke($"    {kv.Key.zahl}{kv.Key.buch}: Lehrer={kv.Value.lehrer}, Blöcke=[{string.Join(",", kv.Value.blockIds)}]");
+
+            // Gruppiere nach Zahl
+            var result = new List<TauschGruppe>();
+            foreach (var gruppe in dict.GroupBy(kv => kv.Key.zahl))
+            {
+                var einträge = gruppe.ToList();
+                if (einträge.Count < 2)
+                {
+                    log?.Invoke($"  Gruppe {gruppe.Key}: nur 1 Buchstabe → übersprungen");
+                    continue;
+                }
+
+                var tg = new TauschGruppe { Zahl = gruppe.Key };
+                foreach (var e in einträge)
+                {
+                    tg.Rollen.Add(new TauschRolle
+                    {
+                        Zahl = gruppe.Key,
+                        Buchstabe = e.Key.buch,
+                        Lehrer = e.Value.lehrer,
+                        Blocks = e.Value.blockIds.ToList()
+                    });
+                }
+
+                result.Add(tg);
+                log?.Invoke($"  Gruppe {gruppe.Key}: {tg.Rollen.Count} Rollen → " +
+                    string.Join(", ", tg.Rollen.Select(r => $"{r.Buchstabe}={r.Lehrer}")));
+            }
+
+            return result;
+        }
+
+        // =====================================================
+        // ALLE ERLAUBTEN EINZELPAARE ERZEUGEN
+        // Aus jeder Gruppe: alle Kombinationen von 2 Rollen.
+        // =====================================================
+        private static List<TauschPaar> BaueAlleEinzelPaare(List<TauschGruppe> gruppen)
+        {
+            var result = new List<TauschPaar>();
+            foreach (var g in gruppen)
+            {
+                var rollen = g.Rollen;
+                for (int i = 0; i < rollen.Count; i++)
+                    for (int j = i + 1; j < rollen.Count; j++)
+                    {
+                        // Lehrer müssen verschieden sein
+                        if (rollen[i].Lehrer == rollen[j].Lehrer) continue;
+                        result.Add(new TauschPaar
+                        {
+                            RolleA = rollen[i],
+                            RolleB = rollen[j]
+                        });
+                    }
+            }
+            return result;
+        }
+
+        // =====================================================
+        // AUSSICHTSREICHSTE KOMBINATIONEN (konfliktbasiert)
+        //
+        // Eine Kombination = Menge von Paaren, wobei jede Rolle
+        // höchstens einmal vorkommt (kein Widerspruch).
+        // Score = aufgelöste Konflikte - neue Konflikte.
+        // =====================================================
+        private static HashSet<string> LehrerVonBlock(UnterrichtsBlock b)
+            => new HashSet<string>(b.Teile.Select(t => t.Lehrer));
+
+        private static int ZähleKonflikte(List<UnterrichtsBlock> bl)
+        {
+            int count = 0;
+            for (int i = 0; i < bl.Count; i++)
+            {
+                var la = LehrerVonBlock(bl[i]);
+                for (int j = i + 1; j < bl.Count; j++)
+                    if (la.Overlaps(LehrerVonBlock(bl[j])))
+                        count++;
+            }
+            return count;
+        }
+
+        // Prüft ob eine Menge von Paaren widerspruchsfrei ist:
+        // Jede Rolle darf höchstens einmal vorkommen.
+        private static bool IstKonsistente_Kombination(List<TauschPaar> paare)
+        {
+            var gesehen = new HashSet<string>();
+            foreach (var p in paare)
+            {
+                string idA = p.RolleA.Zahl + p.RolleA.Buchstabe;
+                string idB = p.RolleB.Zahl + p.RolleB.Buchstabe;
+                if (!gesehen.Add(idA)) return false;
+                if (!gesehen.Add(idB)) return false;
+            }
+            return true;
+        }
+
+        // Prüft ob nach einem Tausch ein Lehrer in so vielen Blöcken vorkommt,
+        // dass seine Wochenstunden nicht mehr in den verfügbaren Slots untergebracht
+        // werden können (Fix-Slot-Konflikte + strukturelle Unmöglichkeiten).
+        private static bool HatFixSlotKonflikt(List<UnterrichtsBlock> b, List<ZeitSlot> s)
+            => HatFixSlotKonfliktMitGrund(b, s, out _);
+
+        private static bool HatFixSlotKonfliktMitGrund(
+            List<UnterrichtsBlock> getauschteBlöcke,
+            List<ZeitSlot> slots,
+            out string grund)
+        {
+            grund = null;
+            var blockByUnr = getauschteBlöcke.ToDictionary(b => b.UNr);
+
+            // (1) Fix-Slot-Konflikte prüfen
+            foreach (var slot in slots)
+            {
+                if (slot.FixUNrn.Count == 0) continue;
+
+                // (1a) Lehrer hat Sperre auf diesem Fix-Slot
+                foreach (var unr in slot.FixUNrn)
+                {
+                    if (!blockByUnr.TryGetValue(unr, out var block)) continue;
+                    foreach (var t in block.Teile)
+                    {
+                        if (slot.LehrerWunsch.TryGetValue(t.Lehrer, out int lw) && lw == -3)
+                        {
+                            grund = $"Lehrer {t.Lehrer} ist in Fix-Slot {slot.WTag} Std.{slot.Stunde} gesperrt (UNr {unr})";
+                            return true;
+                        }
+                    }
+                }
+
+                // (1b) Zwei Fix-Blöcke mit gleichem Lehrer im selben Slot
+                if (slot.FixUNrn.Count < 2) continue;
+                var lehrerImSlot = new HashSet<string>();
+                foreach (var unr in slot.FixUNrn)
+                {
+                    if (!blockByUnr.TryGetValue(unr, out var block)) continue;
+                    foreach (var t in block.Teile)
+                        if (!lehrerImSlot.Add(t.Lehrer))
+                        {
+                            grund = $"Fix-Slot-Konflikt: {t.Lehrer} in {slot.WTag} Std.{slot.Stunde}";
+                            return true;
+                        }
+                }
+            }
+
+            // (2) Wochenstunden > verfügbare Slots
+            var lehrerBlöcke = new Dictionary<string, List<UnterrichtsBlock>>();
+            foreach (var b in getauschteBlöcke)
+                foreach (var t in b.Teile)
+                {
+                    if (!lehrerBlöcke.ContainsKey(t.Lehrer))
+                        lehrerBlöcke[t.Lehrer] = new List<UnterrichtsBlock>();
+                    lehrerBlöcke[t.Lehrer].Add(b);
+                }
+
+            int totalSlots = slots.Count;
+
+            foreach (var kv in lehrerBlöcke)
+            {
+                int totalWst = kv.Value.Sum(b => b.Wst);
+                int gesperrteSlots = slots.Count(s =>
+                    s.LehrerWunsch.TryGetValue(kv.Key, out int w) && w == -3);
+                int verfügbar = totalSlots - gesperrteSlots;
+
+                if (totalWst > verfügbar)
+                {
+                    grund = $"Wst-Überlauf: {kv.Key} hat {totalWst} Wst aber nur {verfügbar} Slots";
+                    return true;
+                }
+            }
+
+            // (3) Lehrer-Duplikat im selben Block
+            foreach (var b in getauschteBlöcke)
+            {
+                var lehrerImBlock = b.Teile.Select(t => t.Lehrer).ToList();
+                if (lehrerImBlock.Count != lehrerImBlock.Distinct().Count())
+                {
+                    var dupl = lehrerImBlock.GroupBy(x => x).Where(g => g.Count() > 1).Select(g => g.Key).First();
+                    grund = $"Duplikat: {dupl} zweimal in UNr {b.UNr}";
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static List<List<TauschPaar>> BestimmeAussichtsreichsteTausche(
+            List<TauschPaar> alleEinzelPaare,
+            List<UnterrichtsBlock> blocks,
+            List<ZeitSlot> slots,
+            int topN,
+            Action<string> log)
+        {
+            int basisKonflikte = ZähleKonflikte(blocks);
+            log($"  Basis-Konflikte (ohne Tausch): {basisKonflikte}");
+
+            int N = alleEinzelPaare.Count;
+            log($"  Erlaubte Einzelpaare: {N} → auswerte alle Kombinationen...");
+
+            var kandidaten = new List<(int nettoGewinn, string key, List<TauschPaar> paare)>();
+
+            // Alle nicht-leeren Teilmengen von Paaren, die konsistent sind
+            // Bei N ≤ 20: Bitmask; sonst nur Einzel- und Zweier
+            IEnumerable<List<TauschPaar>> KombinationenErzeugen()
+            {
+                if (N <= 20)
+                {
+                    for (int mask = 1; mask < (1 << N); mask++)
+                    {
+                        var kombi = new List<TauschPaar>();
+                        for (int i = 0; i < N; i++)
+                            if ((mask & (1 << i)) != 0)
+                                kombi.Add(alleEinzelPaare[i]);
+
+                        if (IstKonsistente_Kombination(kombi))
+                            yield return kombi;
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < N; i++)
+                    {
+                        yield return new List<TauschPaar> { alleEinzelPaare[i] };
+                        for (int j = i + 1; j < N; j++)
+                        {
+                            var kombi = new List<TauschPaar> { alleEinzelPaare[i], alleEinzelPaare[j] };
+                            if (IstKonsistente_Kombination(kombi))
+                                yield return kombi;
+                        }
+                    }
+                }
+            }
+
+            foreach (var kombi in KombinationenErzeugen())
+            {
+                string key = KombiKey(kombi);
+                var (getauscht, getauschteSlots, _) = WendeTauschAn(blocks, slots, new Dictionary<string, int>(), kombi);
+
+                // Kombination überspringen wenn Fix-Slot-Konflikt entsteht
+                string filterGrund = null;
+                if (HatFixSlotKonfliktMitGrund(getauscht, slots, out filterGrund))
+                {
+                    // Einzelpaare immer loggen damit man sieht warum sie gefiltert wurden
+                    if (kombi.Count == 1)
+                        log($"    [{key}] gefiltert: {filterGrund}");
+                    continue;
+                }
+
+                int neueKonflikte = ZähleKonflikte(getauscht);
+                int nettoGewinn = basisKonflikte - neueKonflikte;
+                kandidaten.Add((nettoGewinn, key, kombi));
+            }
+
+            log($"  {kandidaten.Count} konsistente Kombinationen ohne Fix-Slot-Konflikt ausgewertet.");
+
+            // Alle Einzelpaare explizit ausgeben (damit man sieht was jeder Tausch bringt)
+            log($"  Einzelpaar-Scores:");
+            foreach (var (g, k, paare) in kandidaten
+                .Where(x => x.paare.Count == 1)
+                .OrderByDescending(x => x.nettoGewinn))
+                log($"    [{k}]: {g:+0;-0;0} Konflikte");
+
+            // Beste 10 Kombinationen gesamt
+            log($"  Beste Kombinationen gesamt:");
+            foreach (var (g, k, _) in kandidaten
+                .OrderByDescending(x => x.nettoGewinn)
+                .Take(10))
+                log($"    [{k}]: {g:+0;-0;0} Konflikte");
+
+            var gesehen = new HashSet<string>();
+            var result = new List<List<TauschPaar>>();
+
+            // Immer Top-N zurückgeben, auch wenn nettoGewinn <= 0.
+            // Ein Tausch kann trotzdem eine bessere Lösung ergeben,
+            // weil der Solver durch andere Lehrer-Zuordnungen
+            // andere Zeitslots findet.
+            foreach (var (gewinn, key, kombi) in kandidaten
+                .OrderByDescending(k => k.nettoGewinn)
+                .ThenBy(k => k.paare.Count))
+            {
+                if (gesehen.Contains(key)) continue;
+                gesehen.Add(key);
+
+                log($"  → Kandidat {result.Count + 1}: [{key}] {gewinn:+0;-0;0} Konflikte");
+
+                result.Add(kombi);
+                if (result.Count >= topN) break;
+            }
+
+            if (result.Count == 0)
+                log("  Keine konsistenten Kombinationen gefunden.");
+
+            return result;
+        }
+
+        // =====================================================
+        // TAUSCH ANWENDEN (paarbasiert)
+        // Gibt geklonte Blöcke UND geklonte Slots zurück,
+        // in denen auch die LehrerWunsch-Einträge getauscht sind.
+        // =====================================================
+        private static (List<UnterrichtsBlock> blocks, List<ZeitSlot> slots, Dictionary<string, int> extraFreieTage) WendeTauschAn(
+            List<UnterrichtsBlock> original,
+            List<ZeitSlot> originalSlots,
+            Dictionary<string, int> originalExtraFreieTage,
+            List<TauschPaar> paare)
+        {
+            // Tausch-Map: original → neu (bidirektional)
+            var tauschMap = new Dictionary<string, string>();
+            foreach (var paar in paare)
+            {
+                tauschMap[paar.RolleA.Lehrer] = paar.RolleB.Lehrer;
+                tauschMap[paar.RolleB.Lehrer] = paar.RolleA.Lehrer;
+            }
+
+            // Blöcke klonen und Lehrer tauschen
+            var kopie = original.Select(b => new UnterrichtsBlock
+            {
+                UNr = b.UNr,
+                Wst = b.Wst,
+                Zeilentext = b.Zeilentext,
+                WochenDoppelstunden = b.WochenDoppelstunden,
+                DoppelÜberPauseErlaubt = b.DoppelÜberPauseErlaubt,
+                TagesDoppelstunden = new Dictionary<string, int>(b.TagesDoppelstunden),
+                Teile = b.Teile.Select(t => new TeilUnterricht
+                {
+                    UNr = t.UNr,
+                    Lehrer = t.Lehrer,
+                    Fach = t.Fach,
+                    Klassen = new List<string>(t.Klassen),
+                    MinDoppel = t.MinDoppel,
+                    MaxDoppel = t.MaxDoppel,
+                    FachGruppe = t.FachGruppe,
+                    AktuelleDoppelstunden = t.AktuelleDoppelstunden,
+                    Ltkz = t.Ltkz
+                }).ToList()
+            }).ToList();
+
+            foreach (var paar in paare)
+            {
+                foreach (int idx in paar.RolleA.Blocks)
+                    foreach (var t in kopie[idx].Teile)
+                        if (t.Lehrer == paar.RolleA.Lehrer)
+                            t.Lehrer = paar.RolleB.Lehrer;
+
+                foreach (int idx in paar.RolleB.Blocks)
+                    foreach (var t in kopie[idx].Teile)
+                        if (t.Lehrer == paar.RolleB.Lehrer)
+                            t.Lehrer = paar.RolleA.Lehrer;
+            }
+
+            // Slots klonen: LehrerWunsch NICHT tauschen!
+            // Die Zeitwünsche/Sperren gehören zum Lehrer als Person,
+            // nicht zu den Blöcken. Win's Mittwochsperre bleibt bei Win,
+            // egal welche Blöcke Win nach dem Tausch unterrichtet.
+            var slots = originalSlots.Select(s => new ZeitSlot
+            {
+                WTag = s.WTag,
+                Stunde = s.Stunde,
+                BelegteUNrn = new List<int>(s.BelegteUNrn),
+                FixUNrn = new List<int>(s.FixUNrn),
+                LehrerWunsch = new Dictionary<string, int>(s.LehrerWunsch),
+                KlassenWunsch = new Dictionary<string, int>(s.KlassenWunsch),
+            }).ToList();
+
+            // ExtraFreieTage: nicht tauschen - gehören zum Lehrer als Person
+            var extraFreieTage = new Dictionary<string, int>(originalExtraFreieTage);
+
+            return (kopie, slots, extraFreieTage);
+        }
+
+        // =====================================================
+        // TAUSCHLISTE EXPORTIEREN (paarbasiert)
+        // =====================================================
+        private static string ExtrahiereTauschKey(string label)
+        {
+            if (!label.StartsWith("Tausch_")) return "";
+            string ohnePrefix = label.Substring("Tausch_".Length);
+            int letzterUnterstrich = ohnePrefix.LastIndexOf('_');
+            return letzterUnterstrich > 0
+                ? ohnePrefix.Substring(0, letzterUnterstrich)
+                : ohnePrefix;
+        }
+
+        private static void ExportiereTauschListe(
+            string excelPfad,
+            List<UnterrichtsBlock> blocks,
+            List<TauschGruppe> alleGruppen,
+            List<(string label, List<TauschPaar> paare)> topMitTausch,
+            List<string> diagnose)
+        {
+            using var wb = new ClosedXML.Excel.XLWorkbook(excelPfad);
+
+            if (wb.Worksheets.Any(ws => ws.Name == "Tauschliste"))
+                wb.Worksheet("Tauschliste").Delete();
+
+            var sheet = wb.Worksheets.Add("Tauschliste");
+
+            int fixCols = 7; // Gruppe, RolleA, LehrerA, RolleB, LehrerB, UNr(A), UNr(B)
+
+            // Header Fixspalten
+            sheet.Cell(1, 1).Value = "Gruppe";
+            sheet.Cell(1, 2).Value = "Rolle A";
+            sheet.Cell(1, 3).Value = "Lehrer A";
+            sheet.Cell(1, 4).Value = "Rolle B";
+            sheet.Cell(1, 5).Value = "Lehrer B";
+            sheet.Cell(1, 6).Value = "UNr (A)";
+            sheet.Cell(1, 7).Value = "UNr (B)";
+
+            // Dynamische Spalten für jede Tausch-Lösung
+            for (int i = 0; i < topMitTausch.Count; i++)
+                sheet.Cell(1, fixCols + 1 + i).Value =
+                    string.IsNullOrEmpty(topMitTausch[i].label)
+                    ? $"Tausch-Lösung {i + 1}"
+                    : topMitTausch[i].label;
+
+            int totalCols = fixCols + topMitTausch.Count;
+            sheet.Row(1).Style.Font.Bold = true;
+            sheet.Row(1).Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.LightGray;
+
+            // Für jede Tausch-Lösung: welche Paar-Labels sind getauscht?
+            var inLösung = topMitTausch
+                .Select(l => new HashSet<string>(l.paare.Select(p => p.Label)))
+                .ToList();
+
+            var alleEinzelPaare = BaueAlleEinzelPaare(alleGruppen);
+
+            int row = 2;
+            foreach (var paar in alleEinzelPaare)
+            {
+                sheet.Cell(row, 1).Value = paar.RolleA.Zahl;
+                sheet.Cell(row, 2).Value = paar.RolleA.Buchstabe;
+                sheet.Cell(row, 3).Value = paar.RolleA.Lehrer;
+                sheet.Cell(row, 4).Value = paar.RolleB.Buchstabe;
+                sheet.Cell(row, 5).Value = paar.RolleB.Lehrer;
+                sheet.Cell(row, 6).Value = string.Join(", ", paar.RolleA.Blocks.Select(i => blocks[i].UNr));
+                sheet.Cell(row, 7).Value = string.Join(", ", paar.RolleB.Blocks.Select(i => blocks[i].UNr));
+
+                for (int i = 0; i < inLösung.Count; i++)
+                {
+                    bool getauscht = inLösung[i].Contains(paar.Label);
+                    var cell = sheet.Cell(row, fixCols + 1 + i);
+                    cell.Value = getauscht ? "✓ getauscht" : "–";
+                    if (getauscht)
+                        cell.Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.LightGreen;
+                }
+
+                row++;
+            }
+
+            // Diagnose-Block
+            row += 2;
+            sheet.Cell(row, 1).Value = "=== DIAGNOSE TAUSCH-PHASE ===";
+            sheet.Cell(row, 1).Style.Font.Bold = true;
+            sheet.Cell(row, 1).Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.LightBlue;
+            sheet.Range(row, 1, row, Math.Max(totalCols, 9)).Merge();
+            row++;
+
+            foreach (var msg in diagnose)
+            {
+                sheet.Cell(row, 1).Value = msg;
+                sheet.Range(row, 1, row, Math.Max(totalCols, 9)).Merge();
+                if (msg.Contains("Lösungen,"))
+                    sheet.Cell(row, 1).Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.LightGreen;
+                else if (msg.Contains("KEINE LÖSUNG"))
+                    sheet.Cell(row, 1).Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.LightPink;
+                row++;
+            }
+
+            sheet.Columns().AdjustToContents();
+            wb.Save();
+        }
+
+        private static int[,] ExtrahiereBelegung(CpSolver solver, BoolVar[,] x, int B, int S)
+        {
+            var belegung = new int[B, S];
+            for (int b = 0; b < B; b++)
+                for (int s = 0; s < S; s++)
+                    belegung[b, s] = (int)solver.Value(x[b, s]);
+            return belegung;
+        }
+
+        private static bool IstGleichePaedagogischeEinheit(UnterrichtsBlock a, UnterrichtsBlock b)
+        {
+            foreach (var t1 in a.Teile)
+                foreach (var t2 in b.Teile)
+                    if (t1.Fach == t2.Fach && t1.Klassen.Intersect(t2.Klassen).Any())
+                        return true;
+            return false;
+        }
+    }
+}
