@@ -31,16 +31,21 @@
                          VerticalAlignment="Center" Margin="0,0,30,0"/>
 
             <CheckBox x:Name="ChkSpaetePaed" Content="Spaete nichtfixierte paed. Einheiten rot"
-                      VerticalAlignment="Center" Checked="ChkSpaetePaed_Changed" Unchecked="ChkSpaetePaed_Changed"/>
+                      VerticalAlignment="Center" Margin="0,0,20,0" Checked="ChkSpaetePaed_Changed" Unchecked="ChkSpaetePaed_Changed"/>
+
+            <CheckBox x:Name="ChkKlassenVergleich" Content="Klassenvergleich zeigen"
+                      VerticalAlignment="Center" Checked="ChkKlassenVergleich_Changed" Unchecked="ChkKlassenVergleich_Changed"/>
         </StackPanel>
 
         <!-- Hinweiszeile -->
         <TextBlock Grid.Row="1" Margin="0,0,0,8" TextWrapping="Wrap" Foreground="#555"
                    Text="Links Lehrerplan, rechts Klassenplan. Klick auf eine Zelle zeigt im anderen Plan die zugehoerige Klasse bzw. den Lehrer. Ziehen: leere Zelle = verschieben, belegte Zelle gleicher Stundenzahl = tauschen, Parkbereich = entplanen. Ressourcenkonflikte werden hart gesperrt; Qualitaetsprobleme gelb gewarnt."/>
 
-        <!-- Hauptbereich: Lehrerplan | Klassenplan | Vergleich-Vorher | Vergleich-Nachher -->
+        <!-- Hauptbereich: Lehrerplan | Klassenplan | Vergleich-Vorher | Vergleich-Nachher | KlVgl-Vorher | KlVgl-Nachher -->
         <Grid Grid.Row="2">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="Auto"/>
@@ -110,20 +115,60 @@
                     <TextBlock DockPanel.Dock="Top" Text="VORHER" FontWeight="Bold" Height="20"
                                HorizontalAlignment="Center" Margin="0,0,0,2"/>
                     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                        <Grid x:Name="GridVglVorher"/>
+                        <Grid>
+                            <Grid x:Name="GridVglVorher"/>
+                            <Canvas x:Name="VglVorherCanvas" IsHitTestVisible="False"/>
+                        </Grid>
                     </ScrollViewer>
                 </DockPanel>
             </Border>
 
             <!-- VERGLEICH NACHHER -->
             <Border Grid.Column="3" x:Name="BrdVglNachher" BorderBrush="#CCC" BorderThickness="1"
-                    Margin="4,0,0,0" Background="#FBFBFB" Visibility="Collapsed">
+                    Margin="4,0,4,0" Background="#FBFBFB" Visibility="Collapsed">
                 <DockPanel>
                     <Border DockPanel.Dock="Top" Height="32" Margin="4"/>
                     <TextBlock DockPanel.Dock="Top" Text="NACHHER" FontWeight="Bold" Height="20"
                                HorizontalAlignment="Center" Margin="0,0,0,2"/>
                     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                         <Grid x:Name="GridVglNachher"/>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+
+            <!-- KLASSEN-VERGLEICH VORHER -->
+            <Border Grid.Column="4" x:Name="BrdVglKlasseVorher" BorderBrush="#CCC" BorderThickness="1"
+                    Margin="4,0,4,0" Background="#FBFBFB" Visibility="Collapsed">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="4" Height="32">
+                        <TextBlock Text="Vgl.-Klasse:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <Button x:Name="BtnVorigeVglKlasse" Content="&#9664;" Width="28" VerticalAlignment="Center"
+                                Margin="0,0,2,0" Click="BtnVorigeVglKlasse_Click"/>
+                        <ComboBox x:Name="CboVglKlasse" Width="120" VerticalAlignment="Center" Margin="0,0,2,0"
+                                  SelectionChanged="CboVglKlasse_SelectionChanged"/>
+                        <Button x:Name="BtnNaechsteVglKlasse" Content="&#9654;" Width="28" VerticalAlignment="Center"
+                                Click="BtnNaechsteVglKlasse_Click"/>
+                    </StackPanel>
+                    <TextBlock DockPanel.Dock="Top" Text="VORHER (Klasse)" FontWeight="Bold" Height="20"
+                               HorizontalAlignment="Center" Margin="0,0,0,2"/>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <Grid>
+                            <Grid x:Name="GridVglKlasseVorher"/>
+                            <Canvas x:Name="VglKlasseVorherCanvas" IsHitTestVisible="False"/>
+                        </Grid>
+                    </ScrollViewer>
+                </DockPanel>
+            </Border>
+
+            <!-- KLASSEN-VERGLEICH NACHHER -->
+            <Border Grid.Column="5" x:Name="BrdVglKlasseNachher" BorderBrush="#CCC" BorderThickness="1"
+                    Margin="4,0,0,0" Background="#FBFBFB" Visibility="Collapsed">
+                <DockPanel>
+                    <Border DockPanel.Dock="Top" Height="32" Margin="4"/>
+                    <TextBlock DockPanel.Dock="Top" Text="NACHHER (Klasse)" FontWeight="Bold" Height="20"
+                               HorizontalAlignment="Center" Margin="0,0,0,2"/>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <Grid x:Name="GridVglKlasseNachher"/>
                     </ScrollViewer>
                 </DockPanel>
             </Border>

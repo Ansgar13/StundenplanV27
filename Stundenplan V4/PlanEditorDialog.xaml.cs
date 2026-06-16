@@ -486,6 +486,7 @@ namespace Stundenplan_V2
             _letzterDragOverSlot = -2;
             if (PnlTausch != null) PnlTausch.Children.Clear();
             LeereLehrerVergleich();
+            LeereKlassenVergleich();
             LoescheAllePfeile();
         }
 
@@ -635,6 +636,7 @@ namespace Stundenplan_V2
 
             ZeigeDiagnoseDiff(kette);
             BaueLehrerVergleich(kette);
+            BaueKlassenVergleich();
 
             // Pfeile zeichnen: im Klassenplan der ganze Tauschzug, im Lehrerplan
             // der Pfeil fuer den aktuell gezeigten (oder ersten beteiligten) Lehrer.
@@ -747,6 +749,20 @@ namespace Stundenplan_V2
         {
             if (KlasseCanvas != null) KlasseCanvas.Children.Clear();
             if (LehrerCanvas != null) LehrerCanvas.Children.Clear();
+            if (VglVorherCanvas != null) VglVorherCanvas.Children.Clear();
+            if (VglKlasseVorherCanvas != null) VglKlasseVorherCanvas.Children.Clear();
+        }
+
+        // Zeichnet die Pfeile des aktuell fixierten Vorschlags (Tauschkette ODER
+        // Verschiebung-mit-Ausweich) neu. Wird nach einem Wechsel des Vergleichs-
+        // Lehrers/der Vergleichsklasse aufgerufen, damit die VORHER-Vergleichs-
+        // Canvases die Pfeile fuer die neue Auswahl zeigen.
+        private void ZeichneAktuellenVorschlagPfeile()
+        {
+            if (_fixierteKette != null)
+                ZeichnePfeile(_fixierteKette);
+            else if (_fixierteVerschiebung != null)
+                ZeichneVerschiebungsPfeile(_fixierteVerschiebung);
         }
 
         // Zeichnet die Pfeile fuer eine fixierte Kette. Wird nach Layout-Abschluss
@@ -765,6 +781,7 @@ namespace Stundenplan_V2
             {
                 ZeichneKlassenPfeile(kette);
                 ZeichneLehrerPfeil(kette);
+                ZeichneVglVorherPfeile(kette);
             }), System.Windows.Threading.DispatcherPriority.Loaded);
         }
 
@@ -815,8 +832,16 @@ namespace Stundenplan_V2
         // Zeichnet im Klassenplan den Tauschzug: Glied0 -> Glied1 -> ... (-> zurueck bei Ring).
         private void ZeichneKlassenPfeile(Tauschkette kette)
         {
+            ZeichneKlassenPfeileIn(kette, KlasseGrid, KlasseCanvas);
+        }
+
+        // Generische Variante: zeichnet ALLE Glieder-Bewegungen einer Tauschkette
+        // in das angegebene Grid/Canvas-Paar (Klassen-Sichtweise, kein Lehrer-Filter -
+        // ein Ring/Tausch betrifft i.d.R. ohnehin dieselbe Klasse).
+        private void ZeichneKlassenPfeileIn(Tauschkette kette, Grid grid, Canvas canvas)
+        {
             if (kette == null || kette.Glieder == null) return;
-            if (KlasseCanvas == null) return;
+            if (grid == null || canvas == null) return;
             int n = kette.Glieder.Count;
             if (n < 2) return;
 
@@ -830,11 +855,11 @@ namespace Stundenplan_V2
                 // Bei 2er-Tausch nur EIN Doppelpfeil (i==0), nicht zwei
                 if (n == 2 && i == 1) break;
 
-                var pVon = ZellMittelpunkt(KlasseGrid, KlasseCanvas, von);
-                var pNach = ZellMittelpunkt(KlasseGrid, KlasseCanvas, nach);
+                var pVon = ZellMittelpunkt(grid, canvas, von);
+                var pNach = ZellMittelpunkt(grid, canvas, nach);
                 if (pVon == null || pNach == null) continue;
 
-                ZeichnePfeil(KlasseCanvas, pVon.Value, pNach.Value, farbe, doppel: (n == 2));
+                ZeichnePfeil(canvas, pVon.Value, pNach.Value, farbe, doppel: (n == 2));
             }
         }
 
@@ -842,9 +867,16 @@ namespace Stundenplan_V2
         // Unterrichts, den der aktuell gezeigte Lehrer haelt.
         private void ZeichneLehrerPfeil(Tauschkette kette)
         {
-            if (kette == null || kette.Glieder == null || kette.Glieder.Count == 0) return;
-            if (LehrerCanvas == null) return;
             string lehrer = CboLehrer.SelectedItem as string;
+            ZeichneLehrerPfeilIn(kette, lehrer, LehrerGrid, LehrerCanvas);
+        }
+
+        // Generische Variante: zeichnet den EINEN Bewegungspfeil des angegebenen
+        // Lehrers (falls beteiligt) in das angegebene Grid/Canvas-Paar.
+        private void ZeichneLehrerPfeilIn(Tauschkette kette, string lehrer, Grid grid, Canvas canvas)
+        {
+            if (kette == null || kette.Glieder == null || kette.Glieder.Count == 0) return;
+            if (grid == null || canvas == null) return;
             if (lehrer == null) return;
 
             int n = kette.Glieder.Count;
@@ -858,13 +890,38 @@ namespace Stundenplan_V2
                 int von = ErsterSlot(kette.Glieder[i].slots);
                 int nach = ErsterSlot(kette.Glieder[(i + 1) % n].slots);
 
-                var pVon = ZellMittelpunkt(LehrerGrid, LehrerCanvas, von);
-                var pNach = ZellMittelpunkt(LehrerGrid, LehrerCanvas, nach);
+                var pVon = ZellMittelpunkt(grid, canvas, von);
+                var pNach = ZellMittelpunkt(grid, canvas, nach);
                 if (pVon == null || pNach == null) return;
 
                 var farbe = (Color)ColorConverter.ConvertFromString("#0050C8"); // kraeftiges Blau
-                ZeichnePfeil(LehrerCanvas, pVon.Value, pNach.Value, farbe, doppel: false);
+                ZeichnePfeil(canvas, pVon.Value, pNach.Value, farbe, doppel: false);
                 return; // nur ein Pfeil
+            }
+        }
+
+        // Zeichnet die Pfeile fuer eine fixierte Kette zusaetzlich in die
+        // VORHER-Vergleichsgrids (Lehrer- und Klassenvergleich), falls diese
+        // sichtbar sind. Lehrervergleich: nur der Pfeil des aktuell gewaehlten
+        // Vergleichslehrers (CboVglLehrer). Klassenvergleich: alle Glieder-Pfeile,
+        // sofern die gewaehlte Vergleichsklasse (CboVglKlasse) am Tausch beteiligt ist.
+        private void ZeichneVglVorherPfeile(Tauschkette kette)
+        {
+            if (kette == null) return;
+
+            if (BrdVglVorher != null && BrdVglVorher.Visibility == Visibility.Visible)
+            {
+                string vglLehrer = CboVglLehrer.SelectedItem as string;
+                ZeichneLehrerPfeilIn(kette, vglLehrer, GridVglVorher, VglVorherCanvas);
+            }
+
+            if (BrdVglKlasseVorher != null && BrdVglKlasseVorher.Visibility == Visibility.Visible)
+            {
+                string vglKlasse = CboVglKlasse.SelectedItem as string;
+                bool betroffen = vglKlasse != null && kette.Glieder.Any(g =>
+                    _blocks[g.blockIdx].Teile.Any(t => t.Klassen.Contains(vglKlasse)));
+                if (betroffen)
+                    ZeichneKlassenPfeileIn(kette, GridVglKlasseVorher, VglKlasseVorherCanvas);
             }
         }
 
@@ -972,6 +1029,7 @@ namespace Stundenplan_V2
             if (lehrer == null) return;
             ZeichneVglPlan(GridVglVorher, lehrer, _belegung);
             ZeichneVglPlan(GridVglNachher, lehrer, _vglProbe);
+            ZeichneAktuellenVorschlagPfeile();
         }
 
         private void BtnVorigerVglLehrer_Click(object sender, RoutedEventArgs e)
@@ -986,6 +1044,191 @@ namespace Stundenplan_V2
             if (CboVglLehrer.Items.Count == 0) return;
             CboVglLehrer.SelectedIndex = (CboVglLehrer.SelectedIndex + 1) % CboVglLehrer.Items.Count;
         }
+
+        // Zeichnet einen Vergleichs-Lehrerplan: IDENTISCHE Zelldarstellung wie der
+        // Originalplan (nicht interaktiv), danach Hohlstunden leicht rot markiert
+        // und die vom Tausch betroffenen Unterrichte hervorgehoben.
+        // =====================================================
+        // Klassenvergleich vorher/nachher fuer fixierten Vorschlag (optional,
+        // per Checkbox "Klassenvergleich zeigen" zusaetzlich zum Lehrervergleich).
+        // Strukturell identisch zum Lehrervergleich, nur lehrerAnsicht=false.
+        // =====================================================
+        private bool KlassenVergleichAktiv => ChkKlassenVergleich != null && ChkKlassenVergleich.IsChecked == true;
+
+        private void LeereKlassenVergleich()
+        {
+            if (BrdVglKlasseVorher != null) BrdVglKlasseVorher.Visibility = Visibility.Collapsed;
+            if (BrdVglKlasseNachher != null) BrdVglKlasseNachher.Visibility = Visibility.Collapsed;
+            if (CboVglKlasse != null) CboVglKlasse.Items.Clear();
+            if (GridVglKlasseVorher != null) { GridVglKlasseVorher.Children.Clear(); GridVglKlasseVorher.RowDefinitions.Clear(); GridVglKlasseVorher.ColumnDefinitions.Clear(); }
+            if (GridVglKlasseNachher != null) { GridVglKlasseNachher.Children.Clear(); GridVglKlasseNachher.RowDefinitions.Clear(); GridVglKlasseNachher.ColumnDefinitions.Clear(); }
+        }
+
+        // Baut den Klassenvergleich auf Basis der bereits gesetzten _vglProbe auf.
+        // Wird nach BaueLehrerVergleich bzw. im Verschiebung-mit-Ausweich-Pfad
+        // zusaetzlich aufgerufen, wenn die Checkbox aktiv ist.
+        private void BaueKlassenVergleich()
+        {
+            if (!KlassenVergleichAktiv || _vglProbe == null)
+            {
+                LeereKlassenVergleich();
+                return;
+            }
+
+            var geaenderteKlassen = ErmittleGeaenderteKlassen(_belegung, _vglProbe);
+
+            CboVglKlasse.Items.Clear();
+            foreach (var k in geaenderteKlassen.OrderBy(x => x))
+                CboVglKlasse.Items.Add(k);
+
+            if (CboVglKlasse.Items.Count == 0)
+            {
+                BrdVglKlasseVorher.Visibility = Visibility.Collapsed;
+                BrdVglKlasseNachher.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            BrdVglKlasseVorher.Visibility = Visibility.Visible;
+            BrdVglKlasseNachher.Visibility = Visibility.Visible;
+            CboVglKlasse.SelectedIndex = 0; // löst Zeichnen aus
+        }
+
+        // Ermittelt alle Klassen, deren Belegung sich zwischen alt und neu unterscheidet.
+        private HashSet<string> ErmittleGeaenderteKlassen(int[,] alt, int[,] neu)
+        {
+            var klassen = new HashSet<string>();
+            int B = _blocks.Count, S = _slots.Count;
+            for (int b = 0; b < B; b++)
+            {
+                bool blockGeaendert = false;
+                for (int s = 0; s < S; s++)
+                    if (alt[b, s] != neu[b, s]) { blockGeaendert = true; break; }
+                if (!blockGeaendert) continue;
+                foreach (var t in _blocks[b].Teile)
+                    foreach (var k in t.Klassen)
+                        if (!string.IsNullOrWhiteSpace(k))
+                            klassen.Add(k);
+            }
+            return klassen;
+        }
+
+        private void CboVglKlasse_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_initialisiert || _vglProbe == null) return;
+            string klasse = CboVglKlasse.SelectedItem as string;
+            if (klasse == null) return;
+            ZeichneVglKlassenPlan(GridVglKlasseVorher, klasse, _belegung);
+            ZeichneVglKlassenPlan(GridVglKlasseNachher, klasse, _vglProbe);
+            ZeichneAktuellenVorschlagPfeile();
+        }
+
+        private void BtnVorigeVglKlasse_Click(object sender, RoutedEventArgs e)
+        {
+            if (CboVglKlasse.Items.Count == 0) return;
+            int n = CboVglKlasse.Items.Count;
+            CboVglKlasse.SelectedIndex = (CboVglKlasse.SelectedIndex - 1 + n) % n;
+        }
+
+        private void BtnNaechsteVglKlasse_Click(object sender, RoutedEventArgs e)
+        {
+            if (CboVglKlasse.Items.Count == 0) return;
+            CboVglKlasse.SelectedIndex = (CboVglKlasse.SelectedIndex + 1) % CboVglKlasse.Items.Count;
+        }
+
+        private void ChkKlassenVergleich_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!_initialisiert) return;
+            BaueKlassenVergleich();
+        }
+
+        // Zeichnet einen Vergleichs-Klassenplan: IDENTISCHE Zelldarstellung wie der
+        // Originalplan (nicht interaktiv), danach Hohlstunden-Aequivalent (freie
+        // Stunden zwischen erster/letzter Unterrichtsstunde der Klasse) leicht rot
+        // markiert und die vom Tausch betroffenen Unterrichte hervorgehoben.
+        private void ZeichneVglKlassenPlan(Grid grid, string klasse, int[,] belegung)
+        {
+            // 1) Identischer Aufbau wie Originalplan (Klassenansicht, nicht interaktiv)
+            ZeichneEinGrid(grid, klasse, lehrerAnsicht: false, belegung: belegung, interaktiv: false);
+
+            // 2) Freistunden der Klasse leicht rot markieren (leere Slots zwischen
+            //    erster und letzter Unterrichtsstunde des Tages)
+            for (int ti = 0; ti < _tage.Count; ti++)
+            {
+                string tag = _tage[ti];
+                var belegteStunden = new HashSet<int>();
+                for (int s = 0; s < _slots.Count; s++)
+                {
+                    if (_slots[s].WTag != tag) continue;
+                    for (int b = 0; b < _blocks.Count; b++)
+                        if (belegung[b, s] == 1 && _blocks[b].Teile.Any(t => t.Klassen.Contains(klasse)))
+                        { belegteStunden.Add(_slots[s].Stunde); break; }
+                }
+                if (belegteStunden.Count == 0) continue;
+                int erste = belegteStunden.Min();
+                int letzte = belegteStunden.Max();
+
+                for (int hi = 0; hi < _stunden.Count; hi++)
+                {
+                    int stunde = _stunden[hi];
+                    if (stunde <= erste || stunde >= letzte) continue;
+                    if (belegteStunden.Contains(stunde)) continue;
+
+                    // Diese (ti+1, hi+1)-Zelle ist eine Freistunde -> rot einfärben
+                    foreach (var child in grid.Children)
+                    {
+                        if (child is Border bd &&
+                            Grid.GetRow(bd) == hi + 1 && Grid.GetColumn(bd) == ti + 1 &&
+                            bd.Child == null) // leere Zelle
+                        {
+                            bd.Background = new SolidColorBrush(Color.FromRgb(0xFF, 0xE0, 0xE0));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 3) Vom Tausch betroffene Unterrichte dieser Klasse hervorheben.
+            // Betroffen = Bloecke der fixierten Kette ODER der fixierten Verschiebung
+            // mit Ausweich, die diese Klasse betreffen; markiert werden ihre Slots
+            // in DIESER Belegung (Vorher- bzw. Nachher-Belegung).
+            var betroffeneBloecke = new HashSet<int>();
+            if (_fixierteKette != null)
+                foreach (var g in _fixierteKette.Glieder)
+                    if (_blocks[g.blockIdx].Teile.Any(t => t.Klassen.Contains(klasse)))
+                        betroffeneBloecke.Add(g.blockIdx);
+            if (_fixierteVerschiebung != null)
+            {
+                if (_blocks[_fixierteVerschiebung.HauptBlock].Teile.Any(t => t.Klassen.Contains(klasse)))
+                    betroffeneBloecke.Add(_fixierteVerschiebung.HauptBlock);
+                foreach (var aw in _fixierteVerschiebung.Ausweiche)
+                    if (_blocks[aw.block].Teile.Any(t => t.Klassen.Contains(klasse)))
+                        betroffeneBloecke.Add(aw.block);
+            }
+
+            foreach (int b in betroffeneBloecke)
+            {
+                for (int s = 0; s < _slots.Count; s++)
+                {
+                    if (belegung[b, s] != 1) continue;
+                    int ti = _tage.IndexOf(_slots[s].WTag);
+                    int hi = _stunden.IndexOf(_slots[s].Stunde);
+                    if (ti < 0 || hi < 0) continue;
+
+                    foreach (var child in grid.Children)
+                    {
+                        if (child is Border bd &&
+                            Grid.GetRow(bd) == hi + 1 && Grid.GetColumn(bd) == ti + 1)
+                        {
+                            // kraeftiger gruener Rahmen um die betroffene Zelle
+                            bd.BorderBrush = new SolidColorBrush(Color.FromRgb(0x00, 0xA0, 0x00));
+                            bd.BorderThickness = new Thickness(2.5);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
 
         // Zeichnet einen Vergleichs-Lehrerplan: IDENTISCHE Zelldarstellung wie der
         // Originalplan (nicht interaktiv), danach Hohlstunden leicht rot markiert
@@ -1268,38 +1511,54 @@ namespace Stundenplan_V2
             // 2) Fuer jedes Hindernis die moeglichen klasseninternen Ausweich-Tausche sammeln.
             //    Ein Ausweich = Hindernis-Block tauscht innerhalb SEINER Klasse mit einem
             //    anderen Block, sodass es die Zielslots (Y) raeumt.
+            //    Bei genau einem Hindernis werden zusaetzlich 3er- und 4er-Ringe versucht
+            //    (H -> P1 -> P2 -> H bzw. H -> P1 -> P2 -> P3 -> H), begrenzt auf die
+            //    Klasse des Hindernisses (hKlasse) - siehe Schritt 3.
+            //    Diese Vorab-Sammlung wird NUR fuer den 2-Hindernisse-Fall benoetigt;
+            //    beim 1-Hindernis-Fall uebernimmt SucheAusweichKetten die Kandidatensuche.
+            var hListeVorab = hindernisse.ToList();
             var ausweichProHindernis = new Dictionary<int, List<(int partner, List<int> hSlots, List<int> pSlots)>>();
-            foreach (int h in hindernisse)
+            if (hListeVorab.Count == 2)
             {
-                var hSlotsAmTag = ErmittleBlockSlotsAmTag(h, zielSlots[0]);
-                if (hSlotsAmTag.Count == 0) { return ergebnis; }
-                string hKlasse = _blocks[h].Teile.SelectMany(t => t.Klassen).FirstOrDefault();
-                if (hKlasse == null) return ergebnis;
-
-                var partnerKandidaten = SammleKandidaten(hKlasse, hSlotsAmTag.Count, h);
-                var moeglich = new List<(int, List<int>, List<int>)>();
-                foreach (var pk in partnerKandidaten)
+                foreach (int h in hListeVorab)
                 {
-                    // Partner darf nicht selbst auf Y liegen (sonst raeumt es nicht)
-                    if (pk.slots.Any(s => zielSlots.Contains(s))) continue;
-                    moeglich.Add((pk.blockIdx, hSlotsAmTag, pk.slots));
+                    var hSlotsAmTag = ErmittleBlockSlotsAmTag(h, zielSlots[0]);
+                    if (hSlotsAmTag.Count == 0) { return ergebnis; }
+                    string hKlasse = _blocks[h].Teile.SelectMany(t => t.Klassen).FirstOrDefault();
+                    if (hKlasse == null) return ergebnis;
+
+                    var partnerKandidaten = SammleKandidaten(hKlasse, hSlotsAmTag.Count, h);
+                    var moeglich = new List<(int, List<int>, List<int>)>();
+                    foreach (var pk in partnerKandidaten)
+                    {
+                        // Partner darf nicht selbst auf Y liegen (sonst raeumt es nicht)
+                        if (pk.slots.Any(s => zielSlots.Contains(s))) continue;
+                        moeglich.Add((pk.blockIdx, hSlotsAmTag, pk.slots));
+                    }
+                    if (moeglich.Count == 0) return ergebnis; // dieses Hindernis nicht loesbar
+                    ausweichProHindernis[h] = moeglich;
                 }
-                if (moeglich.Count == 0) return ergebnis; // dieses Hindernis nicht loesbar
-                ausweichProHindernis[h] = moeglich;
             }
 
-            // 3) Kombinationen bilden (bei 1 Hindernis: je 1 Ausweich; bei 2: Kreuzprodukt)
-            //    und jeweils die Probe-Belegung bauen + hart pruefen.
+            // 3) Kombinationen bilden (bei 1 Hindernis: 2er-Partner + 3er/4er-Ring;
+            //    bei 2 Hindernissen: Kreuzprodukt nur aus 2er-Partnern) und jeweils
+            //    die Probe-Belegung bauen + hart pruefen.
             var hListe = hindernisse.ToList();
 
             if (hListe.Count == 1)
             {
                 int h = hListe[0];
-                foreach (var aw in ausweichProHindernis[h])
+                string hKlasse = _blocks[h].Teile.SelectMany(t => t.Klassen).FirstOrDefault();
+                var hSlotsAmTag = ErmittleBlockSlotsAmTag(h, zielSlots[0]);
+                if (hSlotsAmTag.Count == 0 || hKlasse == null) return ergebnis;
+
+                // Alle Ausweichketten fuer H sammeln: 2er (direkter Partner),
+                // 3er- und 4er-Ring, alle begrenzt auf hKlasse.
+                var ketten = SucheAusweichKetten(h, hSlotsAmTag, hKlasse);
+
+                foreach (var kette in ketten)
                 {
-                    var v = BaueProbeAusweich(hauptBlock, altSlots, zielSlots,
-                        new List<(int h, int partner, List<int> hSlots, List<int> pSlots)>
-                        { (h, aw.partner, aw.hSlots, aw.pSlots) });
+                    var v = BaueProbeAusweichKette(hauptBlock, altSlots, zielSlots, kette);
                     if (v != null) ergebnis.Add(v);
                 }
             }
@@ -1319,6 +1578,174 @@ namespace Stundenplan_V2
             }
 
             return ergebnis;
+        }
+
+        // ===== Ausweich-Ketten fuer EIN Hindernis: 2er-Partner sowie 3er-/4er-Ring =====
+        // Liefert fuer das Hindernis h (mit seinen Slots hSlots am Zielslot-Tag) alle
+        // moeglichen geschlossenen Ringe innerhalb der Klasse hKlasse, ueber die h seine
+        // Slots raeumen kann. Jede Kette ist eine geordnete Liste von Gliedern
+        // (blockIdx, slots); Glied i erhaelt am Ende die Slots von Glied (i+1) mod n,
+        // wobei h IMMER an Position 0 steht. h's eigene alten Slots (hSlots) werden NICHT
+        // an h zurueckgegeben, sondern gehen an A (die Hauptverschiebung) - h "scheidet"
+        // also faktisch aus dem Ring aus, indem das letzte Glied auf hSlots wandert und
+        // h selbst auf die Slots von Glied 1 (dem ersten Partner) wandert.
+        //
+        // 2er:  h -> P1, P1 -> h(Slots)              (2 Glieder, identisch zum bisherigen Fall)
+        // 3er:  h -> P1, P1 -> P2, P2 -> h(Slots)     (3 Glieder)
+        // 4er:  h -> P1, P1 -> P2, P2 -> P3, P3 -> h(Slots) (4 Glieder)
+        private List<List<(int blockIdx, List<int> slots)>> SucheAusweichKetten(
+            int h, List<int> hSlots, string hKlasse)
+        {
+            var ergebnis = new List<List<(int blockIdx, List<int> slots)>>();
+            if (hKlasse == null || hSlots.Count == 0) return ergebnis;
+
+            int stundenzahl = hSlots.Count;
+            var kandidaten = SammleKandidaten(hKlasse, stundenzahl, h);
+            // Performance-/Uebersichtlichkeitsgrenze: Ring-Suche bei sehr vielen
+            // Kandidaten auf eine handhabbare Menge begrenzen.
+            const int MAX_KANDIDATEN = 20;
+            if (kandidaten.Count > MAX_KANDIDATEN)
+                kandidaten = kandidaten.Take(MAX_KANDIDATEN).ToList();
+
+            var start = (h, hSlots);
+
+            // --- 2er: h <-> P1 ---
+            foreach (var p1 in kandidaten)
+            {
+                var kette = new List<(int, List<int>)> { start, p1 };
+                if (PruefeAusweichKette(kette))
+                    ergebnis.Add(kette);
+            }
+
+            // --- 3er-Ring: h -> P1 -> P2 -> h(Slots) ---
+            for (int i = 0; i < kandidaten.Count; i++)
+                for (int j = 0; j < kandidaten.Count; j++)
+                {
+                    if (i == j) continue;
+                    var kette = new List<(int, List<int>)> { start, kandidaten[i], kandidaten[j] };
+                    if (PruefeAusweichKette(kette))
+                        ergebnis.Add(kette);
+                }
+
+            // --- 4er-Ring: h -> P1 -> P2 -> P3 -> h(Slots) ---
+            for (int i = 0; i < kandidaten.Count; i++)
+                for (int j = 0; j < kandidaten.Count; j++)
+                {
+                    if (j == i) continue;
+                    for (int m = 0; m < kandidaten.Count; m++)
+                    {
+                        if (m == i || m == j) continue;
+                        var kette = new List<(int, List<int>)>
+                            { start, kandidaten[i], kandidaten[j], kandidaten[m] };
+                        if (PruefeAusweichKette(kette))
+                            ergebnis.Add(kette);
+                    }
+                }
+
+            return ergebnis;
+        }
+
+        // Reine Plausibilitaetspruefung einer Ausweichkette VOR dem teuren Probe-Aufbau:
+        // kein Glied darf doppelt vorkommen, kein Glied darf bereits auf seinem
+        // eigenen Zielslot liegen (sonst Nullbewegung).
+        private bool PruefeAusweichKette(List<(int blockIdx, List<int> slots)> kette)
+        {
+            int n = kette.Count;
+            var blockSet = new HashSet<int>();
+            foreach (var g in kette)
+                if (!blockSet.Add(g.blockIdx))
+                    return false; // Block kommt mehrfach vor
+
+            for (int i = 0; i < n; i++)
+            {
+                int ziel = (i + 1) % n;
+                var quelle = new HashSet<int>(kette[i].slots);
+                var zielSlots = new HashSet<int>(kette[ziel].slots);
+                if (quelle.SetEquals(zielSlots))
+                    return false; // Nullbewegung
+            }
+            return true;
+        }
+
+        // Baut die Probe-Belegung fuer eine Ausweich-KETTE (2er bis 4er) und prueft hart.
+        // kette[0] ist immer h selbst. Ringrotation: Glied i -> Slots von Glied (i+1) mod n.
+        // Danach wandert A (hauptBlock) auf zielSlots.
+        private VerschiebungMitAusweich BaueProbeAusweichKette(
+            int hauptBlock, List<int> altSlots, List<int> zielSlots,
+            List<(int blockIdx, List<int> slots)> kette)
+        {
+            int n = kette.Count;
+            var probe = (int[,])_belegung.Clone();
+
+            // A aus alten Slots nehmen
+            foreach (int s in altSlots) probe[hauptBlock, s] = 0;
+
+            // Alle Kettenglieder aus ihren alten Slots nehmen
+            foreach (var g in kette)
+                foreach (int s in g.slots)
+                    probe[g.blockIdx, s] = 0;
+
+            // Ringrotation: Glied i bekommt Slots von Glied (i+1) mod n
+            for (int i = 0; i < n; i++)
+            {
+                int ziel = (i + 1) % n;
+                foreach (int s in kette[ziel].slots)
+                    probe[kette[i].blockIdx, s] = 1;
+            }
+
+            // A auf Zielslots setzen
+            foreach (int s in zielSlots) probe[hauptBlock, s] = 1;
+
+            // Hart pruefen: A an Ziel
+            if (FindeHartenKonflikt(probe, hauptBlock, zielSlots) != null) return null;
+
+            // Hart pruefen: jedes Kettenglied an seinen neuen Slots
+            for (int i = 0; i < n; i++)
+            {
+                int ziel = (i + 1) % n;
+                if (FindeHartenKonflikt(probe, kette[i].blockIdx, kette[ziel].slots) != null)
+                    return null;
+            }
+
+            // Ueberlagerungsprüfung: kein Kettenglied darf an seinem neuen Slot einen
+            // nicht beteiligten Block derselben Klasse/desselben Lehrers ueberlagern.
+            var kettenBloecke = new HashSet<int>(kette.Select(g => g.blockIdx));
+            for (int i = 0; i < n; i++)
+            {
+                int ziel = (i + 1) % n;
+                var block = _blocks[kette[i].blockIdx];
+                var meineLehrer = new HashSet<string>(
+                    block.Teile.Select(t => t.Lehrer).Where(l => !string.IsNullOrWhiteSpace(l)));
+                var meineKlassen = new HashSet<string>(block.Teile.SelectMany(t => t.Klassen));
+
+                foreach (int s in kette[ziel].slots)
+                {
+                    for (int b2 = 0; b2 < _blocks.Count; b2++)
+                    {
+                        if (b2 == hauptBlock) continue; // A selbst ist erlaubt (raeumt ja gerade)
+                        if (kettenBloecke.Contains(b2)) continue;
+                        if (probe[b2, s] != 1) continue;
+                        bool lehrerUeberlapp = _blocks[b2].Teile.Any(t => meineLehrer.Contains(t.Lehrer));
+                        bool klasseUeberlapp = _blocks[b2].Teile.SelectMany(t => t.Klassen).Any(k => meineKlassen.Contains(k));
+                        if (lehrerUeberlapp || klasseUeberlapp)
+                            return null;
+                    }
+                }
+            }
+
+            var v = new VerschiebungMitAusweich
+            {
+                HauptBlock = hauptBlock,
+                AltSlots = altSlots.ToList(),
+                ZielSlots = zielSlots.ToList(),
+                ProbeBelegung = probe
+            };
+            for (int i = 0; i < n; i++)
+            {
+                int ziel = (i + 1) % n;
+                v.Ausweiche.Add((kette[i].blockIdx, kette[i].slots.ToList(), kette[ziel].slots.ToList()));
+            }
+            return v;
         }
 
         // Baut die Probe-Belegung fuer eine Verschiebung-mit-Ausweich und prueft sie hart.
@@ -1538,6 +1965,8 @@ namespace Stundenplan_V2
                 CboVglLehrer.SelectedIndex = 0; // loest ZeichneVglPlan aus
             }
 
+            BaueKlassenVergleich();
+
             // Pfeile fuer die Verschiebung zeichnen
             ZeichneVerschiebungsPfeile(v);
 
@@ -1578,18 +2007,26 @@ namespace Stundenplan_V2
                 var farbeK = (Color)ColorConverter.ConvertFromString("#D1006C"); // Magenta (Klassenplan)
                 var farbeL = (Color)ColorConverter.ConvertFromString("#0050C8"); // Blau (Lehrerplan)
 
+                string vglLehrer = (BrdVglVorher != null && BrdVglVorher.Visibility == Visibility.Visible)
+                    ? CboVglLehrer.SelectedItem as string : null;
+                string vglKlasse = (BrdVglKlasseVorher != null && BrdVglKlasseVorher.Visibility == Visibility.Visible)
+                    ? CboVglKlasse.SelectedItem as string : null;
+
                 // Hauptverschiebung A: alt -> Ziel
-                PfeilFuerBewegung(v.AltSlots, v.ZielSlots, farbeK, farbeL);
+                PfeilFuerBewegung(v.HauptBlock, v.AltSlots, v.ZielSlots, farbeK, farbeL, vglLehrer, vglKlasse);
 
                 // Ausweich-Bewegungen: alt -> neu (je Block)
                 foreach (var aw in v.Ausweiche)
-                    PfeilFuerBewegung(aw.alt, aw.neu, farbeK, farbeL);
+                    PfeilFuerBewegung(aw.block, aw.alt, aw.neu, farbeK, farbeL, vglLehrer, vglKlasse);
             }), System.Windows.Threading.DispatcherPriority.Loaded);
         }
 
-        // Zeichnet einen Bewegungspfeil im Klassenplan (immer) und im Lehrerplan
-        // (nur falls die Slots dort sichtbar sind), von altSlots[0] nach neuSlots[0].
-        private void PfeilFuerBewegung(List<int> altSlots, List<int> neuSlots, Color farbeK, Color farbeL)
+        // Zeichnet einen Bewegungspfeil im Klassenplan und Lehrerplan (Hauptplaene,
+        // immer), sowie zusaetzlich in den VORHER-Vergleichsgrids, sofern der
+        // bewegte Block den jeweils gewaehlten Vergleichslehrer bzw. die gewaehlte
+        // Vergleichsklasse betrifft (vglLehrer/vglKlasse: null = Vergleich nicht aktiv).
+        private void PfeilFuerBewegung(int blockIdx, List<int> altSlots, List<int> neuSlots,
+            Color farbeK, Color farbeL, string vglLehrer, string vglKlasse)
         {
             if (altSlots == null || neuSlots == null || altSlots.Count == 0 || neuSlots.Count == 0) return;
             int von = ErsterSlot(altSlots);
@@ -1604,6 +2041,24 @@ namespace Stundenplan_V2
             var plNach = ZellMittelpunkt(LehrerGrid, LehrerCanvas, nach);
             if (plVon != null && plNach != null)
                 ZeichnePfeil(LehrerCanvas, plVon.Value, plNach.Value, farbeL, doppel: false);
+
+            // VORHER-Vergleich Lehrer: nur wenn dieser Block den Vergleichslehrer betrifft.
+            if (vglLehrer != null && _blocks[blockIdx].Teile.Any(t => t.Lehrer == vglLehrer))
+            {
+                var pvVon = ZellMittelpunkt(GridVglVorher, VglVorherCanvas, von);
+                var pvNach = ZellMittelpunkt(GridVglVorher, VglVorherCanvas, nach);
+                if (pvVon != null && pvNach != null)
+                    ZeichnePfeil(VglVorherCanvas, pvVon.Value, pvNach.Value, farbeL, doppel: false);
+            }
+
+            // VORHER-Vergleich Klasse: nur wenn dieser Block die Vergleichsklasse betrifft.
+            if (vglKlasse != null && _blocks[blockIdx].Teile.Any(t => t.Klassen.Contains(vglKlasse)))
+            {
+                var pvkVon = ZellMittelpunkt(GridVglKlasseVorher, VglKlasseVorherCanvas, von);
+                var pvkNach = ZellMittelpunkt(GridVglKlasseVorher, VglKlasseVorherCanvas, nach);
+                if (pvkVon != null && pvkNach != null)
+                    ZeichnePfeil(VglKlasseVorherCanvas, pvkVon.Value, pvkNach.Value, farbeK, doppel: false);
+            }
         }
 
 
@@ -2061,16 +2516,44 @@ namespace Stundenplan_V2
             e.Effects = DragDropEffects.Move;
             e.Handled = true;
 
-            // Nur bei aktivem Block-Drag (nicht Parkbereich) und vorhandenen Vorschlaegen
+            // Nur bei aktivem Block-Drag (nicht Parkbereich)
             if (_dragQuelle == null || _dragQuelle.AusParkbereich) return;
-            if (_aktuelleKetten == null || _aktuelleKetten.Count == 0) return;
             if (!(sender is Border bd) || !(bd.Tag is int zielSlot)) return;
 
             // Nur neu zeichnen, wenn sich das ueberfahrene Feld geaendert hat
             if (zielSlot == _letzterDragOverSlot) return;
             _letzterDragOverSlot = zielSlot;
 
-            ZeichneTauschliste(zielSlot >= 0 ? zielSlot : (int?)null);
+            // Linkes Panel: vorhandene Ketten (klassenintern) nur umsortieren/hervorheben.
+            if (_aktuelleKetten != null && _aktuelleKetten.Count > 0)
+                ZeichneTauschliste(zielSlot >= 0 ? zielSlot : (int?)null);
+
+            // Rechtes Panel: Verschiebung mit Ausweich live fuer den aktuell
+            // ueberfahrenen Zielslot berechnen und anzeigen - ohne dass erst
+            // losgelassen werden muss.
+            if (zielSlot < 0)
+            {
+                LeereVerschiebungen();
+                return;
+            }
+
+            int blockIdx = _dragQuelle.BlockIndex;
+            var quellSlots = _dragQuelle.SlotIndizes;
+            var zielSlots = BerechneZielSlots(quellSlots, zielSlot);
+            if (zielSlots == null)
+            {
+                LeereVerschiebungen();
+                return;
+            }
+
+            // Nur sinnvoll, wenn der Block tatsaechlich verschoben wuerde (Ziel != Quelle).
+            if (new HashSet<int>(zielSlots).SetEquals(new HashSet<int>(quellSlots)))
+            {
+                LeereVerschiebungen();
+                return;
+            }
+
+            ZeigeVerschiebungen(blockIdx, quellSlots, zielSlots);
         }
 
         // =====================================================
@@ -2223,7 +2706,17 @@ namespace Stundenplan_V2
             string konflikt = FindeHartenKonflikt(probe, blockIdx, zielSlots);
             if (konflikt != null)
             {
-                SetStatus("Gesperrt: " + konflikt, true);
+                // Der Zielslot ist in der AKTUELL angezeigten Klasse leer (sonst waeren
+                // wir nicht hier), aber der Block kann trotzdem kollidieren - z.B. weil
+                // derselbe Lehrer zur gleichen Zeit in einer ANDEREN Klasse unterrichtet.
+                // In diesem Fall ebenfalls nach Verschiebung-mit-Ausweich suchen, statt
+                // nur zu sperren.
+                ZeigeVerschiebungen(blockIdx, quellSlots, zielSlots);
+
+                if (_aktuelleVerschiebungen.Count > 0)
+                    SetStatus("Direkte Verschiebung nicht moeglich — siehe 'Verschiebung mit Ausweich'.", false);
+                else
+                    SetStatus("Gesperrt: " + konflikt, true);
                 return;
             }
 

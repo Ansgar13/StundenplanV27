@@ -181,6 +181,44 @@ namespace Stundenplan_V2
                     }
                 }
 
+                // ZUSAMMENHANGS-CONSTRAINT: Bei Bloecken mit maxD>0 (Doppelstunden erlaubt)
+                // duerfen an einem Tag NICHT zwei (oder mehr) Einzelstunden ohne Doppelstunde
+                // liegen. Die bisherige Tagesregel prueft nur die ANZAHL Stunden pro Tag
+                // (<=1 ohne Doppel-Vorgabe, <=2 mit Doppel-Vorgabe), nicht aber, ob zwei
+                // Stunden tatsaechlich zusammenhaengen. Ohne diesen Constraint kann der
+                // Solver z.B. zwei Einzelstunden an verschiedenen Tagesenden platzieren,
+                // was an dem Tag wie eine aufgeloeste Doppelstunde wirkt, aber keine ist.
+                // Formal: xSum(Tag) <= 1 + 2 * dSum(Tag) — ohne zusammenhaengende
+                // Doppelstunde an diesem Tag (dSum=0) ist nur 1 Stunde erlaubt; mit
+                // einer Doppelstunde (dSum=1) duerfen es bis zu 3 sein (die generelle
+                // Tagesregel-Obergrenze von 2 greift unabhaengig weiterhin).
+                foreach (var tag in tage)
+                {
+                    var daySlotsD = slots
+                        .Select((z, i) => new { z, i })
+                        .Where(z => z.z.WTag == tag)
+                        .Select(z => z.i)
+                        .ToList();
+
+                    for (int b = 0; b < B; b++)
+                    {
+                        int maxD = blocks[b].Teile.Max(t => t.MaxDoppel);
+                        if (maxD <= 0) continue; // ohne Doppel-Vorgabe greift bereits limit=1 oben
+
+                        var xVarsTag = daySlotsD.Select(s => x[b, s]).ToList();
+                        if (xVarsTag.Count == 0) continue;
+
+                        var dVarsTag = new List<BoolVar>();
+                        for (int idx = 0; idx < daySlotsD.Count - 1; idx++)
+                        {
+                            int s = daySlotsD[idx];
+                            if (d[b, s] != null) dVarsTag.Add(d[b, s]);
+                        }
+
+                        model.Add(LinearExpr.Sum(xVarsTag) <= 1 + 2 * LinearExpr.Sum(dVarsTag));
+                    }
+                }
+
                 // Verbot späte Doppelstunden
                 if (verbotSpäteDoppel)
                 {

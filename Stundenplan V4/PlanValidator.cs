@@ -263,6 +263,13 @@ namespace Stundenplan_V2
             // =====================================================
             // 7. TAGESREGEL: Block ohne Dopp an mehr als 1 Tag
             //                Block mit Dopp an mehr als 2 Stunden pro Tag
+            //                Block mit Dopp-Vorgabe (maxD>0): liegen an einem Tag
+            //                genau 2 (oder mehr) Stunden, muessen mindestens 2 davon
+            //                tatsaechlich zusammenhaengen (echte Doppelstunde). Zwei
+            //                Einzelstunden am selben Tag ohne Zusammenhang zaehlen
+            //                zwar nicht zu viel (Anzahl <= limit), verletzen aber
+            //                trotzdem die Tagesregel, da sie keine gueltige
+            //                Doppelstunden-Struktur bilden.
             // =====================================================
             for (int b = 0; b < B; b++)
             {
@@ -270,19 +277,42 @@ namespace Stundenplan_V2
 
                 var proTag = blockSlots[b]
                     .GroupBy(s => slots[s].WTag)
-                    .ToDictionary(g => g.Key, g => g.Count());
+                    .ToDictionary(g => g.Key, g => g.OrderBy(s => s).ToList());
 
                 foreach (var kv in proTag)
                 {
+                    int anzahl = kv.Value.Count;
                     int limit = maxD > 0 ? 2 : 1;
-                    if (kv.Value > limit)
+
+                    if (anzahl > limit)
+                    {
                         verletzungen.Add(new Verletzung(
                             "Tagesregel",
                             kv.Key, 0, blocks[b].UNr,
                             string.Join(", ", blocks[b].Teile.Select(t => t.Lehrer).Distinct())
                                 + " | " + string.Join(", ", blocks[b].Teile.SelectMany(t => t.Klassen).Distinct()),
                             blocks[b].Zeilentext,
-                            $"{kv.Value} Stunden an {kv.Key} (max {limit})"));
+                            $"{anzahl} Stunden an {kv.Key} (max {limit})"));
+                        continue;
+                    }
+
+                    // Zusammenhangs-Pruefung: bei maxD>0 und genau 2 Stunden am Tag
+                    // muessen diese 2 Stunden direkt aufeinanderfolgen.
+                    if (maxD > 0 && anzahl == 2)
+                    {
+                        int s1 = kv.Value[0];
+                        int s2 = kv.Value[1];
+                        bool zusammenhaengend = slots[s1].WTag == slots[s2].WTag &&
+                                                 slots[s1].Stunde + 1 == slots[s2].Stunde;
+                        if (!zusammenhaengend)
+                            verletzungen.Add(new Verletzung(
+                                "Tagesregel",
+                                kv.Key, 0, blocks[b].UNr,
+                                string.Join(", ", blocks[b].Teile.Select(t => t.Lehrer).Distinct())
+                                    + " | " + string.Join(", ", blocks[b].Teile.SelectMany(t => t.Klassen).Distinct()),
+                                blocks[b].Zeilentext,
+                                $"2 Einzelstunden an {kv.Key} ({slots[s1].Stunde}, {slots[s2].Stunde}) statt einer Doppelstunde"));
+                    }
                 }
             }
 
