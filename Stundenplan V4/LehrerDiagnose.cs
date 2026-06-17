@@ -39,6 +39,11 @@ namespace Stundenplan_V2
 
     public static class LehrerDiagnose
     {
+        // Hervorhebung für "-2"-Verletzungsspalten (Minus2Verletzungen / FreiT.-2):
+        // kräftiges Gold/Amber statt des bisherigen blassen LightYellow, damit
+        // diese Zellen in der Diag-Tabelle schneller ins Auge fallen.
+        private static readonly XLColor FarbeMinus2Warnung = XLColor.FromArgb(0xFF, 0xC1, 0x07);
+
         /// <summary>
         /// Berechnet die Diagnose aller Lehrer für eine Lösung
         /// </summary>
@@ -389,10 +394,10 @@ namespace Stundenplan_V2
                     {
                         sheet.Cell(zeile, col + 8).Value = d.Minus2Verletzungen;
                         if (d.Minus2Verletzungen > 0)
-                            sheet.Cell(zeile, col + 8).Style.Fill.BackgroundColor = XLColor.LightYellow;
+                            sheet.Cell(zeile, col + 8).Style.Fill.BackgroundColor = FarbeMinus2Warnung;
                         sheet.Cell(zeile, col + 9).Value = d.Minus2FreiTageVerletzungen;
                         if (d.Minus2FreiTageVerletzungen > 0)
-                            sheet.Cell(zeile, col + 9).Style.Fill.BackgroundColor = XLColor.LightYellow;
+                            sheet.Cell(zeile, col + 9).Style.Fill.BackgroundColor = FarbeMinus2Warnung;
                     }
 
                     // Dstd-V und TR-V (letzte zwei Spalten), rot bei > 0
@@ -471,13 +476,13 @@ namespace Stundenplan_V2
                     sheet.Cell(sumZeile, col + 8).Value = sumMinus2;
                     sheet.Cell(sumZeile, col + 8).Style.Font.Bold = true;
                     sheet.Cell(sumZeile, col + 8).Style.Fill.BackgroundColor =
-                        sumMinus2 > 0 ? XLColor.LightYellow : XLColor.LightGray;
+                        sumMinus2 > 0 ? FarbeMinus2Warnung : XLColor.LightGray;
 
                     int sumFreiT = diags.Sum(d => d.Minus2FreiTageVerletzungen);
                     sheet.Cell(sumZeile, col + 9).Value = sumFreiT;
                     sheet.Cell(sumZeile, col + 9).Style.Font.Bold = true;
                     sheet.Cell(sumZeile, col + 9).Style.Fill.BackgroundColor =
-                        sumFreiT > 0 ? XLColor.LightYellow : XLColor.LightGray;
+                        sumFreiT > 0 ? FarbeMinus2Warnung : XLColor.LightGray;
                 }
 
                 // Summe Dstd-V und TR-V

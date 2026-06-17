@@ -198,6 +198,11 @@ namespace Stundenplan_V2
                     .ToList();
                 LehrerDiagnose.ExportiereDstdF(excelPfad, dstdFDaten, input.Slots, vorherLöschen: true);
 
+                // Gesicherte Lösungen wurden durch das Leeren oben aus dem
+                // Diag-/Dstd-F-Sheet entfernt — hier sofort wieder anhängen,
+                // damit sie dauerhaft zum Vergleich verfügbar bleiben.
+                ErgaenzeDiagnoseFuerGesicherte();
+
                 Log("Diagnose-Tabelle erstellt.");
             }
             catch (Exception ex)
@@ -416,6 +421,8 @@ namespace Stundenplan_V2
                         .Select(sol => (sol.label, sol.belegung, sol.blocks))
                         .ToList();
                     LehrerDiagnose.ExportiereDstdF(excelPfad, dstdFDaten6, input.Slots, vorherLöschen: true);
+
+                    ErgaenzeDiagnoseFuerGesicherte();
                 }
                 catch { /* Diagnose-Fehler ignorieren */ }
 
@@ -605,6 +612,8 @@ namespace Stundenplan_V2
                         .Select(sol => (sol.label, sol.belegung, sol.blocks))
                         .ToList();
                     LehrerDiagnose.ExportiereDstdF(excelPfad, dstdFDaten9, input.Slots, vorherLöschen: true);
+
+                    ErgaenzeDiagnoseFuerGesicherte();
                 }
                 catch { /* Diagnose-Fehler ignorieren */ }
 
@@ -962,6 +971,45 @@ namespace Stundenplan_V2
         }
 
         // =====================================================
+        // FIX UNRN: EINZELNEN EINTRAG AUS EINEM SLOT ENTFERNEN
+        // Im Unterschied zu EntferneAusFixUNrn (oben) wird die UNr NUR aus der
+        // Zeile des angegebenen Slots entfernt, nicht aus allen Zeilen — wichtig,
+        // da dieselbe UNr an mehreren Slots fixiert sein kann (Wochenstunden > 1).
+        // Wird vom Plan-Editor beim Entfixieren einer Einzelstunde aufgerufen.
+        // =====================================================
+        private void EntferneAusFixUNrnSlot(int slotIdx, int unr)
+        {
+            using var wb = new XLWorkbook(excelPfad);
+            if (!wb.Worksheets.Any(ws => ws.Name == "Fix UNrn")) return;
+
+            var sheet = wb.Worksheet("Fix UNrn");
+            string wtag = input.Slots[slotIdx].WTag;
+            int stunde = input.Slots[slotIdx].Stunde;
+
+            foreach (var row in sheet.RowsUsed().Skip(1))
+            {
+                if (row.Cell(1).GetString().Trim() != wtag ||
+                    row.Cell(2).GetString().Trim() != stunde.ToString())
+                    continue;
+
+                int lastCol = row.LastCellUsed()?.Address.ColumnNumber ?? 2;
+                var verbleibende = new List<int>();
+                for (int col = 3; col <= lastCol; col++)
+                {
+                    if (int.TryParse(row.Cell(col).GetString(), out int v) && v != unr)
+                        verbleibende.Add(v);
+                }
+                for (int col = 3; col <= lastCol; col++)
+                    row.Cell(col).Clear();
+                for (int i = 0; i < verbleibende.Count; i++)
+                    row.Cell(3 + i).Value = verbleibende[i];
+                break;
+            }
+
+            wb.Save();
+        }
+
+        // =====================================================
         // TOP-PLÄNE IN TABELLE 2 SCHREIBEN
         // =====================================================
         private void SchreibeInExcel(
@@ -1269,13 +1317,36 @@ namespace Stundenplan_V2
                 MeldeMinus2 = input.VerbotMinus2Verletzungen || input.StrafeMinus2Verletzungen > 0
             };
 
+            // Callback: einzelne Stunde im Plan-Editor fixieren/entfixieren
+            // (Rechtsklick-Kontextmenü, nur Einzelstunden-Modus). Schreibt direkt
+            // in die Excel-Tabelle "Fix UNrn" und aktualisiert input.Slots, damit
+            // das blaue "F" im Editor sofort ohne Neuladen erscheint/verschwindet.
+            Action<int, int, bool> aendereFixUNr = (slotIdx, unr, fixieren) =>
+            {
+                var slot = input.Slots[slotIdx];
+                if (fixieren)
+                {
+                    SchreibeFixUNrn(new Dictionary<int, List<int>> { [slotIdx] = new List<int> { unr } });
+                    if (!slot.FixUNrn.Contains(unr))
+                        slot.FixUNrn.Add(unr);
+                    Log($"Plan-Editor: UNr {unr} in {slot.WTag} Std{slot.Stunde} fixiert.");
+                }
+                else
+                {
+                    EntferneAusFixUNrnSlot(slotIdx, unr);
+                    slot.FixUNrn.Remove(unr);
+                    Log($"Plan-Editor: Fixierung von UNr {unr} in {slot.WTag} Std{slot.Stunde} entfernt.");
+                }
+            };
+
             var editor = new PlanEditorDialog(
                 loesungenFürEditor,
                 input.Slots,
                 input.Fachraeume,
                 input.GrossePausen,
                 uebernehmen,
-                bewParam)
+                bewParam,
+                aendereFixUNr)
             { Owner = this };
 
             editor.ShowDialog();
@@ -1326,7 +1397,20 @@ namespace Stundenplan_V2
 
             try
             {
+                // Falls unter diesem Namen bereits eine Sicherung bestand: den
+                // zugehörigen (jetzt veralteten) Diagnose-Block zuerst entfernen,
+                // damit ErgaenzeDiagnoseFuerGesicherte() gleich danach einen
+                // frischen Block mit den aktuellen Werten anhängen kann statt
+                // den alten stehen zu lassen.
+                EntferneDiagnoseFuerLabel("[Gesichert] " + name.Trim());
+
                 SichereLösung(name.Trim(), sol.belegung, sol.blocks);
+
+                // Diagnose-Werte der gesicherten Lösung sofort im Sheet "Diag"
+                // verfügbar machen (statt erst beim nächsten Solver-/
+                // Verbesserungs-Lauf), und dort dauerhaft (nicht überschreibbar).
+                ErgaenzeDiagnoseFuerGesicherte();
+
                 MessageBox.Show($"Lösung '{gewähltesLabel}' wurde als '{name.Trim()}' im Sheet 'Gesichert' abgelegt.\n\n" +
                                  "Sie bleibt dort erhalten, bis du sie über 'Gesicherte Lösung löschen' aktiv entfernst — " +
                                  "auch über erneutes Laden, Solver-Läufe und Plan-Editor-Übernahmen hinweg.",
@@ -1410,6 +1494,146 @@ namespace Stundenplan_V2
         }
 
         // =====================================================
+        // DIAGNOSE FÜR GESICHERTE LÖSUNGEN ERGÄNZEN
+        // Wird nach jedem Diag-/Dstd-F-Export mit vorherLöschen:true
+        // aufgerufen (dabei werden die Sheets komplett geleert und nur mit
+        // den Lösungen DIESES Laufs neu beschrieben) sowie direkt beim
+        // Sichern einer Lösung. Hängt die aktuell berechneten Diagnose-Werte
+        // aller dauerhaft gesicherten Lösungen (Sheet "Gesichert") wieder an,
+        // damit sie dort permanent zum Vergleich stehen bleiben und nicht
+        // durch Solver- oder Verbesserungs-Läufe verloren gehen.
+        // =====================================================
+        private void ErgaenzeDiagnoseFuerGesicherte()
+        {
+            try
+            {
+                var gesicherte = LadeGesicherteLösungen();
+                if (gesicherte.Count == 0) return;
+
+                bool meldeMinus2 = input.VerbotMinus2Verletzungen || input.StrafeMinus2Verletzungen > 0;
+
+                var diagnoseDaten = gesicherte
+                    .Select(sol => (
+                        sol.label,
+                        LehrerDiagnose.Berechne(
+                            sol.belegung,
+                            sol.blocks,
+                            input.Slots,
+                            input.LehrerStammdaten,
+                            input.StrafeHohlstunde,
+                            input.StrafeDoppelHohlstunde,
+                            input.StrafeDreifachHohlstunde,
+                            input.StrafeStdFolge,
+                            meldeMinus2,
+                            input.ExtraFreieTage,
+                            input.LehrerFreiTageMinus2)))
+                    .ToList();
+
+                LehrerDiagnose.Exportiere(excelPfad, diagnoseDaten, vorherLöschen: false, meldeLeherMinus2: meldeMinus2);
+
+                var dstdFDaten = gesicherte
+                    .Select(sol => (sol.label, sol.belegung, sol.blocks))
+                    .ToList();
+                LehrerDiagnose.ExportiereDstdF(excelPfad, dstdFDaten, input.Slots, vorherLöschen: false);
+            }
+            catch (Exception ex)
+            {
+                Log($"Hinweis: Diagnose für gesicherte Lösungen konnte nicht ergänzt werden: {ex.Message}");
+            }
+        }
+
+        // =====================================================
+        // DIAGNOSE-BLOCK FÜR EIN LABEL ENTFERNEN (Diag + Dstd-F)
+        // Wird aufgerufen, BEVOR eine Lösung unter einem bereits vorhandenen
+        // Namen erneut gesichert wird: ohne dieses Aufräumen würde der alte,
+        // inzwischen veraltete Diagnose-Block unter demselben Label stehen
+        // bleiben (ErgaenzeDiagnoseFuerGesicherte hängt nur NEUE Labels an,
+        // bereits vorhandene werden beim Anhängen übersprungen).
+        // Spalten/Zeilen werden geleert statt gelöscht, damit andere Blöcke
+        // nicht verschoben werden — ErgaenzeDiagnoseFuerGesicherte fügt direkt
+        // danach einen frischen Block mit aktuellen Werten am Ende an.
+        // =====================================================
+        private void EntferneDiagnoseFuerLabel(string label)
+        {
+            try
+            {
+                using var wb = new XLWorkbook(excelPfad);
+
+                // ---- "Diag": horizontaler Block, Label nur in der Anker-Zelle
+                //      (Zeile 1, über colsProLösung Spalten gemergt) ----
+                if (wb.Worksheets.Any(ws => ws.Name == "Diag"))
+                {
+                    var sheet = wb.Worksheet("Diag");
+                    var headerRow = sheet.Row(1);
+                    int maxCol = headerRow.LastCellUsed()?.Address.ColumnNumber ?? 1;
+                    int ankerCol = -1;
+                    for (int c = 2; c <= maxCol; c++)
+                    {
+                        if (headerRow.Cell(c).GetString().Trim() == label)
+                        {
+                            ankerCol = c;
+                            break;
+                        }
+                    }
+                    if (ankerCol > 0)
+                    {
+                        // Blockende: bis kurz vor die nächste beschriftete Spalte
+                        // (oder Sheet-Ende, falls letzter Block).
+                        int endCol = maxCol;
+                        for (int c = ankerCol + 1; c <= maxCol; c++)
+                        {
+                            if (!headerRow.Cell(c).IsEmpty())
+                            {
+                                endCol = c - 1;
+                                break;
+                            }
+                        }
+                        int lastRow = sheet.LastRowUsed()?.RowNumber() ?? 1;
+                        sheet.Range(1, ankerCol, lastRow, endCol).Clear();
+                    }
+                }
+
+                // ---- "Dstd-F": vertikaler Block, Label fett in Spalte A ----
+                if (wb.Worksheets.Any(ws => ws.Name == "Dstd-F"))
+                {
+                    var sheet = wb.Worksheet("Dstd-F");
+                    int lastRow = sheet.LastRowUsed()?.RowNumber() ?? 1;
+                    int kopfZeile = -1;
+                    for (int r = 1; r <= lastRow; r++)
+                    {
+                        var z = sheet.Cell(r, 1);
+                        if (z.Style.Font.Bold && z.GetString().Trim() == label)
+                        {
+                            kopfZeile = r;
+                            break;
+                        }
+                    }
+                    if (kopfZeile > 0)
+                    {
+                        // Blockende: bis zur nächsten Leerzeile (Trennzeile
+                        // zwischen Lösungsblöcken) oder Sheet-Ende.
+                        int endZeile = lastRow;
+                        for (int r = kopfZeile + 1; r <= lastRow; r++)
+                        {
+                            if (sheet.Cell(r, 1).IsEmpty())
+                            {
+                                endZeile = r - 1;
+                                break;
+                            }
+                        }
+                        sheet.Range(kopfZeile, 1, endZeile, 8).Clear();
+                    }
+                }
+
+                wb.Save();
+            }
+            catch (Exception ex)
+            {
+                Log($"Hinweis: Alter Diagnose-Block für '{label}' konnte nicht entfernt werden: {ex.Message}");
+            }
+        }
+
+        // =====================================================
         // BUTTON – GESICHERTE LÖSUNG LÖSCHEN
         // Einzige Möglichkeit, eine im Sheet "Gesichert" abgelegte Lösung
         // wieder zu entfernen — geschieht NIE automatisch.
@@ -1454,6 +1678,12 @@ namespace Stundenplan_V2
             try
             {
                 LöscheGesicherteLösung(gewählterName);
+
+                // Zugehörigen Diagnose-Block ebenfalls entfernen, damit im Sheet
+                // "Diag" keine Karteikarte für eine nicht mehr existierende
+                // gesicherte Lösung zurückbleibt.
+                EntferneDiagnoseFuerLabel("[Gesichert] " + gewählterName);
+
                 MessageBox.Show($"Gesicherte Lösung '{gewählterName}' wurde gelöscht.");
                 Log($"Gesicherte Lösung '{gewählterName}' gelöscht.");
             }

@@ -20,6 +20,10 @@ namespace Stundenplan_V2
         // Callback an MainWindow: (label, geänderte belegung, blocks) -> übernimmt in Lös + Diag
         private readonly Action<string, int[,], List<UnterrichtsBlock>> _uebernehmenCallback;
 
+        // Callback an MainWindow: (slotIdx, UNr, fixieren true/false) -> schreibt/entfernt
+        // den Eintrag in der Excel-Tabelle "Fix UNrn" und aktualisiert input.Slots in-memory.
+        private readonly Action<int, int, bool> _aendereFixUNrCallback;
+
         // ---- Arbeitskopie ----
         private string _aktLabel;
         private int[,] _belegung;                 // Arbeitskopie (wird editiert)
@@ -72,7 +76,8 @@ namespace Stundenplan_V2
             Dictionary<string, int> fachraumLimit,
             List<(int stundeVor, int stundeNach)> grossePausen,
             Action<string, int[,], List<UnterrichtsBlock>> uebernehmenCallback,
-            BewertungsParameter bewParam = null)
+            BewertungsParameter bewParam = null,
+            Action<int, int, bool> aendereFixUNrCallback = null)
         {
             InitializeComponent();
 
@@ -81,6 +86,7 @@ namespace Stundenplan_V2
             _fachraumLimit = fachraumLimit ?? new Dictionary<string, int>();
             _grossePausen = grossePausen ?? new List<(int, int)>();
             _uebernehmenCallback = uebernehmenCallback;
+            _aendereFixUNrCallback = aendereFixUNrCallback;
             _bewParam = bewParam ?? new BewertungsParameter();
 
             // Tage in Eingabereihenfolge, Stunden sortiert
@@ -378,6 +384,7 @@ namespace Stundenplan_V2
             bool warnung = SlotHatWarnung(blockIdx, slotIdx);
             bool hervorheben = _highlightBloecke.Contains(blockIdx);
             bool spaetPaed = _spaetePaedBloecke.Contains(blockIdx);
+            bool istFixiert = slotIdx >= 0 && slotIdx < _slots.Count && _slots[slotIdx].FixUNrn.Contains(block.UNr);
 
             // Hintergrund-Priorität: spaete päd. Einheit (rot) > Warnung (gelb) > normal (hellblau)
             Brush hintergrund;
@@ -415,7 +422,29 @@ namespace Stundenplan_V2
             tb.Inlines.Add(new System.Windows.Documents.Run(lehrer + "\n") { Foreground = Brushes.DarkSlateGray, FontWeight = FontWeights.SemiBold });
             tb.Inlines.Add(new System.Windows.Documents.Run("UNr " + block.UNr + "  " + block.Zeilentext) { FontSize = 10, Foreground = Brushes.Gray });
 
-            innerBorder.Child = tb;
+            if (istFixiert)
+            {
+                // Kleines blaues "F" oben rechts: zeigt, dass diese Stunde im
+                // Fix-UNr-Plan steht (nur im Plan-Editor-Grid sichtbar).
+                var inhalt = new Grid();
+                inhalt.Children.Add(tb);
+                var fLabel = new TextBlock
+                {
+                    Text = "F",
+                    FontSize = 11,
+                    FontWeight = FontWeights.Bold,
+                    Foreground = new SolidColorBrush(Color.FromRgb(0x10, 0x4A, 0xE0)),
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    VerticalAlignment = VerticalAlignment.Top,
+                    Margin = new Thickness(0, -2, 1, 0)
+                };
+                inhalt.Children.Add(fLabel);
+                innerBorder.Child = inhalt;
+            }
+            else
+            {
+                innerBorder.Child = tb;
+            }
 
             // Tag: [blockIdx, slotIdx, lehrerAnsicht(0/1)]
             innerBorder.Tag = new[] { blockIdx, slotIdx, lehrerAnsicht ? 1 : 0 };
@@ -423,9 +452,65 @@ namespace Stundenplan_V2
             {
                 innerBorder.MouseLeftButtonDown += Teil_MouseLeftButtonDown;
                 innerBorder.MouseMove += Teil_MouseMove;
+                innerBorder.ContextMenuOpening += Teilbereich_ContextMenuOpening;
             }
 
             return innerBorder;
+        }
+
+        // =====================================================
+        // Rechtsklick-Kontextmenü: einzelne Stunde fixieren/entfixieren
+        // Nur im Einzelstunden-Modus verfügbar.
+        // =====================================================
+        private void Teilbereich_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+        {
+            if (!(sender is Border bd) || !(bd.Tag is int[] arr))
+            {
+                e.Handled = true;
+                return;
+            }
+            if (RbEinzel.IsChecked != true || _aendereFixUNrCallback == null)
+            {
+                e.Handled = true; // Im Block-Modus / ohne Callback kein Kontextmenü
+                return;
+            }
+
+            int blockIdx = arr[0];
+            int slotIdx = arr[1];
+            var block = _blocks[blockIdx];
+            bool istFixiert = _slots[slotIdx].FixUNrn.Contains(block.UNr);
+
+            var menu = new ContextMenu();
+            var item = new MenuItem
+            {
+                Header = istFixiert
+                    ? $"Fixierung von UNr {block.UNr} entfernen"
+                    : $"UNr {block.UNr} hier fixieren"
+            };
+            item.Click += (s2, e2) => UmschalteFixierung(blockIdx, slotIdx, istFixiert);
+            menu.Items.Add(item);
+            bd.ContextMenu = menu;
+        }
+
+        // fixiertWar = Zustand VOR dem Klick (true = war fixiert -> wird entfernt)
+        private void UmschalteFixierung(int blockIdx, int slotIdx, bool fixiertWar)
+        {
+            int unr = _blocks[blockIdx].UNr;
+            var slot = _slots[slotIdx];
+            try
+            {
+                _aendereFixUNrCallback?.Invoke(slotIdx, unr, !fixiertWar);
+                SetStatus(
+                    (fixiertWar ? "Fixierung entfernt: " : "Fixiert: ") +
+                    "UNr " + unr + " in " + slot.WTag + " Std" + slot.Stunde,
+                    false);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Fehler bei Fixierung: " + ex.Message, true);
+                return;
+            }
+            ZeichneBeideGrids();
         }
 
         // =====================================================
@@ -1561,6 +1646,28 @@ namespace Stundenplan_V2
                     var v = BaueProbeAusweichKette(hauptBlock, altSlots, zielSlots, kette);
                     if (v != null) ergebnis.Add(v);
                 }
+
+                // NEU: rekursives Freimachen - h soll bevorzugt auf A's frei
+                // werdende altSlots wandern (der naheliegende Gegen-Tausch);
+                // klappt das nicht direkt, weil h selbst in einer ANDEREN
+                // Klasse zur Zeit von altSlots schon Unterricht hat, wird das
+                // jeweils blockierende Hindernis klassenintern in SEINER
+                // EIGENEN Klasse weggetauscht - rekursiv, bis FREIMACHEN_MAX_TIEFE.
+                // Nur sinnvoll, wenn die Stundenzahl von h's Tag mit A's
+                // altSlots uebereinstimmt (sonst passt h gar nicht 1:1 dorthin).
+                if (hSlotsAmTag.Count == altSlots.Count)
+                {
+                    var bereitsBewegt = new HashSet<int> { hauptBlock, h };
+                    var freimachKetten = SucheFreimachKetten(
+                        h, hSlotsAmTag, altSlots, bereitsBewegt, tiefe: 1,
+                        maxErgebnisse: FREIMACHEN_MAX_ERGEBNISSE);
+
+                    foreach (var schritte in freimachKetten)
+                    {
+                        var v = BaueProbeFuerFreimachKette(hauptBlock, altSlots, zielSlots, schritte);
+                        if (v != null) ergebnis.Add(v);
+                    }
+                }
             }
             else // genau 2 Hindernisse
             {
@@ -1575,6 +1682,24 @@ namespace Stundenplan_V2
                               (h2, a2.partner, a2.hSlots, a2.pSlots) });
                         if (v != null) ergebnis.Add(v);
                     }
+            }
+
+            // Interne Duplikate entfernen (z.B. wenn der bisherige Ring-Ansatz
+            // und das neue rekursive Freimachen zufaellig dieselbe Loesung
+            // finden).
+            var gesehene = new HashSet<string>();
+            ergebnis = ergebnis.Where(v => gesehene.Add(BildeSignaturAusVerschiebung(v))).ToList();
+
+            // Duplikate zur linken Liste (Tauschvorschlaege) herausfiltern:
+            // beide Suchen koennen unabhaengig voneinander denselben einfachen
+            // klasseninternen Tausch finden - in der rechten Liste soll dann
+            // nur stehen, was ueber die linke Liste hinausgeht. Die linke
+            // Liste (_aktuelleKetten) selbst wird dabei nur gelesen, nicht
+            // veraendert.
+            if (_aktuelleKetten != null && _aktuelleKetten.Count > 0)
+            {
+                var linkeSignaturen = new HashSet<string>(_aktuelleKetten.Select(BildeSignaturAusKette));
+                ergebnis = ergebnis.Where(v => !linkeSignaturen.Contains(BildeSignaturAusVerschiebung(v))).ToList();
             }
 
             return ergebnis;
@@ -1805,6 +1930,206 @@ namespace Stundenplan_V2
                 if (_belegung[blockIdx, s] == 1 && _slots[s].WTag == tag)
                     slots.Add(s);
             return slots;
+        }
+
+        // =====================================================
+        // NEU: Rekursives "Freimachen" eines Zielslots (nur fuer die rechte
+        // Liste "Verschiebung mit Ausweich" - die linke Liste der einfachen
+        // Tauschvorschlaege bleibt unveraendert).
+        //
+        // Konzept: A soll von altSlots nach zielSlots (Y). Sitzt dort ein
+        // Hindernis h, ist der naheliegendste Versuch, dass h im Gegenzug auf
+        // A's frei werdende altSlots wandert (klassischer 2er-Tausch). Klappt
+        // das nicht direkt, weil h selbst in einer ANDEREN Klasse zur Zeit von
+        // altSlots schon Unterricht hat, wird rekursiv versucht, DIESES neue
+        // Hindernis seinerseits klassenintern (in SEINER EIGENEN Klasse)
+        // wegzutauschen - und so weiter, bis zu einer Tiefenbegrenzung. Da bei
+        // jedem Schritt die Klasse(n) des jeweils aktuellen Hindernisses
+        // verwendet werden, ergeben sich automatisch auch klassenuebergreifende
+        // Loesungen, ohne dass die Klassenbindung kuenstlich aufgeweicht werden
+        // muss.
+        // =====================================================
+
+        private const int FREIMACHEN_MAX_TIEFE = 3;
+        private const int FREIMACHEN_MAX_ERGEBNISSE = 6;
+
+        // Liefert den Block, der z's Landung auf zielSlots verhindert (Klassen-
+        // oder Lehrerkonflikt mit z), oder -1 wenn frei. Bloecke aus "ignoriere"
+        // zaehlen nicht als Hindernis, da sie in dieser Kette ohnehin wegziehen.
+        private int FindeKollidierendenBlock(int z, List<int> zielSlots, HashSet<int> ignoriere)
+        {
+            var zKlassen = new HashSet<string>(_blocks[z].Teile.SelectMany(t => t.Klassen));
+            var zLehrer = new HashSet<string>(
+                _blocks[z].Teile.Select(t => t.Lehrer).Where(l => !string.IsNullOrWhiteSpace(l)));
+
+            foreach (int s in zielSlots)
+                for (int b = 0; b < _blocks.Count; b++)
+                {
+                    if (b == z) continue;
+                    if (ignoriere.Contains(b)) continue;
+                    if (_blocks[b].UNr == _blocks[z].UNr) continue; // Parallelteile derselben UNr
+                    if (_belegung[b, s] != 1) continue;
+
+                    bool klasseKoll = _blocks[b].Teile.SelectMany(t => t.Klassen).Any(k => zKlassen.Contains(k));
+                    bool lehrerKoll = _blocks[b].Teile.Any(t => zLehrer.Contains(t.Lehrer));
+                    if (klasseKoll || lehrerKoll)
+                        return b;
+                }
+            return -1;
+        }
+
+        // Rekursive Suche: versucht, Block z auf zielSlotsZ unterzubringen -
+        // direkt, oder indem ein dort sitzendes Hindernis klassenintern (in
+        // dessen EIGENER Klasse) wegtauscht, was bei Bedarf rekursiv genauso
+        // aufgeloest wird. Gibt alle gefundenen alternativen Schrittfolgen
+        // zurueck (jede Schrittfolge enthaelt z's eigenen Schritt als erstes
+        // Element).
+        private List<List<(int blockIdx, List<int> von, List<int> zu)>> SucheFreimachKetten(
+            int z, List<int> vonZ, List<int> zielSlotsZ,
+            HashSet<int> bereitsBewegt, int tiefe, int maxErgebnisse)
+        {
+            var alleErgebnisse = new List<List<(int, List<int>, List<int>)>>();
+            var eigenerSchritt = (z, vonZ, zielSlotsZ);
+
+            if (maxErgebnisse <= 0) return alleErgebnisse;
+
+            int c = FindeKollidierendenBlock(z, zielSlotsZ, bereitsBewegt);
+            if (c == -1)
+            {
+                alleErgebnisse.Add(new List<(int, List<int>, List<int>)> { eigenerSchritt });
+                return alleErgebnisse;
+            }
+
+            if (tiefe >= FREIMACHEN_MAX_TIEFE || bereitsBewegt.Contains(c))
+                return alleErgebnisse; // hier nicht aufloesbar, leere Liste
+
+            var cVon = ErmittleBlockSlotsAmTag(c, zielSlotsZ[0]);
+            if (cVon.Count == 0) return alleErgebnisse;
+
+            var bewegtMitC = new HashSet<int>(bereitsBewegt) { z, c };
+
+            // Ueber ALLE Klassen von c suchen (nicht nur die erste) - dadurch
+            // fliessen automatisch auch Klassen ein, die mit der urspruenglich
+            // gegriffenen Klasse nichts zu tun haben.
+            foreach (string klasseVonC in _blocks[c].Teile.SelectMany(t => t.Klassen).Distinct())
+            {
+                var kandidaten = SammleKandidaten(klasseVonC, cVon.Count, c)
+                    .Where(k => !bewegtMitC.Contains(k.blockIdx));
+
+                foreach (var kandidat in kandidaten)
+                {
+                    if (alleErgebnisse.Count >= maxErgebnisse) return alleErgebnisse;
+
+                    var weitereOptionen = SucheFreimachKetten(
+                        c, cVon, kandidat.slots, bewegtMitC, tiefe + 1,
+                        maxErgebnisse - alleErgebnisse.Count);
+
+                    foreach (var weitere in weitereOptionen)
+                    {
+                        var gesamt = new List<(int, List<int>, List<int>)> { eigenerSchritt };
+                        gesamt.AddRange(weitere);
+                        alleErgebnisse.Add(gesamt);
+                        if (alleErgebnisse.Count >= maxErgebnisse) return alleErgebnisse;
+                    }
+                }
+            }
+
+            return alleErgebnisse;
+        }
+
+        // Baut aus einer Schrittfolge (HauptBlock-Verschiebung + alle
+        // "Freimachen"-Schritte) eine Probe-Belegung und prueft sie hart -
+        // analog BaueProbeAusweichKette, aber fuer beliebig tiefe, nicht auf
+        // eine einzelne Klasse begrenzte Ketten.
+        private VerschiebungMitAusweich BaueProbeFuerFreimachKette(
+            int hauptBlock, List<int> altSlots, List<int> zielSlots,
+            List<(int blockIdx, List<int> von, List<int> zu)> schritte)
+        {
+            var probe = (int[,])_belegung.Clone();
+
+            foreach (int s in altSlots) probe[hauptBlock, s] = 0;
+            foreach (var schritt in schritte)
+                foreach (int s in schritt.von)
+                    probe[schritt.blockIdx, s] = 0;
+
+            foreach (int s in zielSlots) probe[hauptBlock, s] = 1;
+            foreach (var schritt in schritte)
+                foreach (int s in schritt.zu)
+                    probe[schritt.blockIdx, s] = 1;
+
+            if (FindeHartenKonflikt(probe, hauptBlock, zielSlots) != null) return null;
+            foreach (var schritt in schritte)
+                if (FindeHartenKonflikt(probe, schritt.blockIdx, schritt.zu) != null) return null;
+
+            // Ueberlagerungspruefung: kein beteiligter Block darf an seinem
+            // neuen Slot einen NICHT beteiligten Block derselben Klasse/
+            // desselben Lehrers ueberlagern (analog BaueProbeAusweichKette).
+            var beteiligte = new HashSet<int>(schritte.Select(s => s.blockIdx)) { hauptBlock };
+
+            bool PrüfeUeberlagerung(int blockIdx, List<int> neueSlots)
+            {
+                var block = _blocks[blockIdx];
+                var meineLehrer = new HashSet<string>(
+                    block.Teile.Select(t => t.Lehrer).Where(l => !string.IsNullOrWhiteSpace(l)));
+                var meineKlassen = new HashSet<string>(block.Teile.SelectMany(t => t.Klassen));
+
+                foreach (int s in neueSlots)
+                    for (int b2 = 0; b2 < _blocks.Count; b2++)
+                    {
+                        if (beteiligte.Contains(b2)) continue;
+                        if (probe[b2, s] != 1) continue;
+                        bool lehrerUeberlapp = _blocks[b2].Teile.Any(t => meineLehrer.Contains(t.Lehrer));
+                        bool klasseUeberlapp = _blocks[b2].Teile.SelectMany(t => t.Klassen).Any(k => meineKlassen.Contains(k));
+                        if (lehrerUeberlapp || klasseUeberlapp) return false;
+                    }
+                return true;
+            }
+
+            if (!PrüfeUeberlagerung(hauptBlock, zielSlots)) return null;
+            foreach (var schritt in schritte)
+                if (!PrüfeUeberlagerung(schritt.blockIdx, schritt.zu)) return null;
+
+            var v = new VerschiebungMitAusweich
+            {
+                HauptBlock = hauptBlock,
+                AltSlots = altSlots.ToList(),
+                ZielSlots = zielSlots.ToList(),
+                ProbeBelegung = probe
+            };
+            foreach (var schritt in schritte)
+                v.Ausweiche.Add((schritt.blockIdx, schritt.von.ToList(), schritt.zu.ToList()));
+            return v;
+        }
+
+        // Kanonische Signatur einer Verschiebung: sortierte Liste von
+        // (blockIdx, sortierte Ziel-Slot-Indizes) ueber alle beteiligten
+        // Bloecke. Wird ausschliesslich zum Duplikat-Abgleich der rechten
+        // Liste verwendet (gegen sich selbst UND gegen die linke Liste) -
+        // die linke Liste selbst wird dafuer nicht veraendert, nur gelesen.
+        private string BildeBewegungsSignatur(List<(int blockIdx, List<int> ziel)> bewegungen)
+        {
+            return string.Join("|", bewegungen
+                .OrderBy(m => m.blockIdx)
+                .Select(m => m.blockIdx + ":" + string.Join(",", m.ziel.OrderBy(s => s))));
+        }
+
+        private string BildeSignaturAusKette(Tauschkette kette)
+        {
+            int n = kette.Glieder.Count;
+            var bewegungen = new List<(int blockIdx, List<int> ziel)>();
+            for (int i = 0; i < n; i++)
+            {
+                int zielIdx = (i + 1) % n;
+                bewegungen.Add((kette.Glieder[i].blockIdx, kette.Glieder[zielIdx].slots));
+            }
+            return BildeBewegungsSignatur(bewegungen);
+        }
+
+        private string BildeSignaturAusVerschiebung(VerschiebungMitAusweich v)
+        {
+            var bewegungen = new List<(int blockIdx, List<int> ziel)> { (v.HauptBlock, v.ZielSlots) };
+            bewegungen.AddRange(v.Ausweiche.Select(aw => (aw.block, aw.neu)));
+            return BildeBewegungsSignatur(bewegungen);
         }
 
         // ===== Anzeige der Verschiebung-mit-Ausweich-Vorschlaege =====
