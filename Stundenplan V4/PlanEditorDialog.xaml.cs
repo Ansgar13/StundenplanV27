@@ -351,6 +351,20 @@ namespace Stundenplan_V2
 
             border.Background = Brushes.White;
 
+            // Gewichtungszahl aus den Zeitwünschen für diesen Slot (z.B. eine
+            // kleine "-3" für eine Sperre): das ist ein Merkmal des ZEITSLOTS
+            // selbst (Lehrer- bzw. Klassen-Zeitwunsch je nach Ansicht), nicht
+            // eines einzelnen Unterrichts - daher hier auf Zellen-Ebene einmal
+            // ermittelt, unabhaengig davon, ob/wie viele parallele Bloecke
+            // in der Zelle liegen, und auch auf leeren Zellen sichtbar.
+            int? wunsch = null;
+            if (auswahl != null)
+            {
+                var wunschQuelle = lehrerAnsicht ? _slots[slotIdx].LehrerWunsch : _slots[slotIdx].KlassenWunsch;
+                if (wunschQuelle.TryGetValue(auswahl, out int wunschWert))
+                    wunsch = wunschWert;
+            }
+
             var blockIdxInSlot = new List<int>();
             for (int b = 0; b < _blocks.Count; b++)
             {
@@ -362,11 +376,13 @@ namespace Stundenplan_V2
             }
 
             if (blockIdxInSlot.Count == 0)
+            {
+                if (wunsch.HasValue) border.Child = BaueWunschLabel(wunsch.Value);
                 return border;
+            }
 
             // UniformGrid (1 Zeile) verteilt parallele Bloecke gleichmaessig auf die volle Zellbreite
             var hStack = new System.Windows.Controls.Primitives.UniformGrid { Rows = 1 };
-            border.Child = hStack;
 
             foreach (int b in blockIdxInSlot.Take(3))
             {
@@ -374,7 +390,43 @@ namespace Stundenplan_V2
                 hStack.Children.Add(teil);
             }
 
+            if (wunsch.HasValue)
+            {
+                // Ueberlagerung: hStack fuellt die ganze Zelle, das Label legt
+                // sich unten rechts unabhaengig darueber - einmal pro Zelle.
+                var zellInhalt = new Grid();
+                zellInhalt.Children.Add(hStack);
+                zellInhalt.Children.Add(BaueWunschLabel(wunsch.Value));
+                border.Child = zellInhalt;
+            }
+            else
+            {
+                border.Child = hStack;
+            }
+
             return border;
+        }
+
+        // Kleine Gewichtungszahl (Zeitwunsch des Slots, z.B. "-3" fuer eine
+        // Sperre) fuer die untere rechte Ecke der Zelle. Negative Werte
+        // (unerwuenschte Zeiten) in Rot, positive in Gruen. Nimmt keine
+        // Mausereignisse an, damit Drag&Drop/Klick auf der Zelle ungestoert
+        // funktionieren.
+        private TextBlock BaueWunschLabel(int wert)
+        {
+            return new TextBlock
+            {
+                Text = wert.ToString(),
+                FontSize = 10,
+                FontWeight = FontWeights.Bold,
+                Foreground = wert < 0
+                    ? new SolidColorBrush(Color.FromRgb(0xC0, 0x20, 0x20))
+                    : new SolidColorBrush(Color.FromRgb(0x20, 0x90, 0x20)),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(0, 0, 2, -1),
+                IsHitTestVisible = false
+            };
         }
 
         // Ein Teilbereich = ein Block in diesem Slot (Drag-Quelle + Klick-Sync)
